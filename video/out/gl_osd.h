@@ -18,4 +18,7 @@ enum sub_bitmap_format mpgl_osd_get_part_format(struct mpgl_osd *ctx, int index)
 struct gl_vao *mpgl_osd_get_vao(struct mpgl_osd *ctx);
 void mpgl_osd_draw_part(struct mpgl_osd *ctx, int vp_w, int vp_h, int index);
 
+void mpgl_osd_draw(struct mpgl_osd *ctx, const struct mp_osd_res *res,
+                   double pts, void(*cb)(void*,struct sub_bitmaps*), void *p);
+
 #endif

@@ -461,7 +461,7 @@ void mpgl_load_functions2(GL *gl, void *(*get_fn)(void *ctx, const char *n),
             for (int i = 0; fnlist && fnlist[i].name; i++) {
                 const struct gl_function *fn = &fnlist[i];
                 void **funcptr = (void**)(((char*)gl) + fn->offset);
-                if (loaded[i])
+                if (loaded[i] && !*funcptr)
                     *funcptr = loaded[i];
             }
         }
@@ -551,6 +551,7 @@ static const struct backend backends[] = {
 #if HAVE_EGL_X11
     {"x11egl", mpgl_set_backend_x11egl},
 #endif
+    {0}
 };
 
 int mpgl_find_backend(const char *name)

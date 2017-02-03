@@ -64,6 +64,7 @@ struct gl_video_opts {
     int chroma_location;
     int use_rectangle;
     struct m_color background;
+    char *custom_shader;
     int interpolation;
     int blend_subs;
     char *source_shader;
@@ -109,5 +110,6 @@ bool gl_video_showing_interpolated_frame(struct gl_video *p);
 
 struct gl_hwdec;
 void gl_video_set_hwdec(struct gl_video *p, struct gl_hwdec *hwdec);
+void gl_video_render_osd(struct gl_video *p, const struct mp_osd_res *res, void(*cb)(void*,struct sub_bitmaps*), void *ctx);
 
 #endif

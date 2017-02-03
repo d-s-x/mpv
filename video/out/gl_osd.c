@@ -421,3 +421,9 @@ void mpgl_osd_generate(struct mpgl_osd *ctx, struct mp_osd_res res, double pts,
     osd_draw(ctx->osd, s_res, pts, draw_flags, ctx->formats, gen_osd_cb, ctx);
     ctx->stereo_mode = stereo_mode;
 }
+
+void mpgl_osd_draw(struct mpgl_osd *ctx, const struct mp_osd_res *res,
+                   double pts, void(*cb)(void*,struct sub_bitmaps*), void *p)
+{
+    osd_draw(ctx->osd, *res, pts, 0, ctx->formats, cb, p);
+}

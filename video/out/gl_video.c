@@ -455,6 +455,7 @@ const struct m_sub_options gl_video_conf = {
         OPT_STRINGLIST("post-shaders", post_shaders, 0),
 
         OPT_REMOVED("approx-gamma", "this is always enabled now"),
+        OPT_STRING("custom-shader", custom_shader, 0),
         OPT_REMOVED("cscale-down", "chroma is never downscaled"),
         OPT_REMOVED("scale-sep", "this is set automatically whenever sane"),
         OPT_REMOVED("indirect", "this is set automatically whenever sane"),
@@ -1617,6 +1618,8 @@ static void pass_convert_yuv(struct gl_video *p)
     } else if (p->opts.alpha_mode == 2) { // blend
         GLSL(color = vec4(color.rgb * color.a, 1.0);)
     }
+    if (p->opts.custom_shader && strlen(p->opts.custom_shader))
+        GLSLF("%s\n", p->opts.custom_shader);
 }
 
 static void get_scale_factors(struct gl_video *p, double xy[2])
@@ -2196,6 +2199,12 @@ static void gl_video_interpolate_frame(struct gl_video *p, int fbo,
     }
 }
 
+void gl_video_render_osd(struct gl_video *p, const struct mp_osd_res *res, void(*cb)(void*,struct sub_bitmaps*), void *ctx)
+{
+	if (p->osd)
+		mpgl_osd_draw(p->osd, res, p->osd_pts, cb, ctx);
+}
+
 // (fbo==0 makes BindFramebuffer select the screen backbuffer)
 void gl_video_render_frame(struct gl_video *p, int fbo, struct frame_timing *t)
 {
@@ -2227,7 +2236,7 @@ void gl_video_render_frame(struct gl_video *p, int fbo, struct frame_timing *t)
 
         debug_check_gl(p, "after video rendering");
     }
-
+/*
     gl->BindFramebuffer(GL_FRAMEBUFFER, fbo);
 
     if (p->osd) {
@@ -2235,7 +2244,7 @@ void gl_video_render_frame(struct gl_video *p, int fbo, struct frame_timing *t)
                       p->osd_pts, p->osd_rect, p->vp_w, p->vp_h, fbo, true);
         debug_check_gl(p, "after OSD rendering");
     }
-
+*/
     gl->UseProgram(0);
     gl->BindFramebuffer(GL_FRAMEBUFFER, 0);
 
