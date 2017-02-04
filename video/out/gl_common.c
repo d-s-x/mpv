@@ -44,23 +44,6 @@
 #include "options/options.h"
 #include "options/m_option.h"
 
-struct feature {
-    int id;
-    const char *name;
-};
-
-static const struct feature features[] = {
-    {MPGL_CAP_FB,               "Framebuffers"},
-    {MPGL_CAP_VAO,              "VAOs"},
-    {MPGL_CAP_FLOAT_TEX,        "Float textures"},
-    {MPGL_CAP_TEX_RG,           "RG textures"},
-    {MPGL_CAP_1D_TEX,           "1D textures"},
-    {MPGL_CAP_3D_TEX,           "3D textures"},
-    {MPGL_CAP_DEBUG,            "debugging extensions"},
-    {MPGL_CAP_SW,               "suspected software renderer"},
-    {0},
-};
-
 // This guesses if the current GL context is a suspected software renderer.
 static bool is_software_gl(GL *gl)
 {
@@ -142,7 +125,6 @@ static const struct gl_functions gl_functions[] = {
             DEF_FN(Flush),
             DEF_FN(GenBuffers),
             DEF_FN(GenTextures),
-            DEF_FN(GetBooleanv),
             DEF_FN(GetAttribLocation),
             DEF_FN(GetError),
             DEF_FN(GetIntegerv),
@@ -190,7 +172,6 @@ static const struct gl_functions gl_functions[] = {
     {
         .ver_core = 300,
         .ver_es_core = 300,
-        .provides = MPGL_CAP_3D_TEX,
         .functions = (const struct gl_function[]) {
             DEF_FN(GetStringi),
             // for ES 3.0
@@ -210,7 +191,7 @@ static const struct gl_functions gl_functions[] = {
     // Framebuffers, extension in GL 2.x, core in GL 3.x core.
     {
         .ver_core = 300,
-        .ver_es_core = 300,
+        .ver_es_core = 200,
         .extension = "GL_ARB_framebuffer_object",
         .provides = MPGL_CAP_FB,
         .functions = (const struct gl_function[]) {
@@ -307,6 +288,15 @@ static const struct gl_functions gl_functions[] = {
             {0}
         },
     },
+    // These don't exist - they are for the sake of mpv internals, and libmpv
+    // interaction (see libmpv/opengl_cb.h).
+    {
+        .extension = "GL_MP_D3D_interfaces",
+        .functions = (const struct gl_function[]) {
+            DEF_FN(MPGetD3DInterface),
+            {0}
+        },
+    },
 };
 
 #undef FN_OFFS
@@ -366,12 +356,6 @@ void mpgl_load_functions2(GL *gl, void *(*get_fn)(void *ctx, const char *n),
     if (shader)
         mp_verbose(log, "GL_SHADING_LANGUAGE_VERSION='%s'\n", shader);
 
-    // Note: This code doesn't handle CONTEXT_FORWARD_COMPATIBLE_BIT_ARB
-    //       on OpenGL 3.0 correctly. Apparently there's no way to detect this
-    //       situation, because GL_ARB_compatibility is specified only for 3.1
-    //       and above.
-
-    bool has_legacy = false;
     if (gl->version >= 300) {
         gl->GetStringi = get_fn(fn_ctx, "glGetStringi");
         gl->GetIntegerv = get_fn(fn_ctx, "glGetIntegerv");
@@ -384,38 +368,22 @@ void mpgl_load_functions2(GL *gl, void *(*get_fn)(void *ctx, const char *n),
         for (int n = 0; n < exts; n++) {
             const char *ext = gl->GetStringi(GL_EXTENSIONS, n);
             gl->extensions = talloc_asprintf_append(gl->extensions, " %s", ext);
-            if (strcmp(ext, "GL_ARB_compatibility") == 0)
-                has_legacy = true;
         }
 
-        // This version doesn't have GL_ARB_compatibility yet, and always
-        // includes legacy (except with CONTEXT_FORWARD_COMPATIBLE_BIT_ARB).
-        if (gl->version == 300)
-            has_legacy = true;
     } else {
         const char *ext = (char*)gl->GetString(GL_EXTENSIONS);
         gl->extensions = talloc_asprintf_append(gl->extensions, " %s", ext);
-
-        has_legacy = true;
     }
 
-    if (gl->es)
-        has_legacy = false;
-
-    if (has_legacy)
-        mp_verbose(log, "OpenGL legacy compat. found.\n");
     mp_dbg(log, "Combined OpenGL extensions string:\n%s\n", gl->extensions);
 
-    for (int n = 0; n < sizeof(gl_functions) / sizeof(gl_functions[0]); n++) {
+    for (int n = 0; n < MP_ARRAY_SIZE(gl_functions); n++) {
         const struct gl_functions *section = &gl_functions[n];
         int version = gl->es ? gl->es : gl->version;
         int ver_core = gl->es ? section->ver_es_core : section->ver_core;
         int ver_removed = gl->es ? section->ver_es_removed : section->ver_removed;
 
-        // With has_legacy, the legacy functions are still available, and
-        // functions are never actually removed. (E.g. the context could be at
-        // version >= 3.0, but functions like glBegin still exist and work.)
-        if (!has_legacy && ver_removed && version >= ver_removed)
+        if (ver_removed && version >= ver_removed)
             continue;
 
         // NOTE: Function entrypoints can exist, even if they do not work.
@@ -446,10 +414,8 @@ void mpgl_load_functions2(GL *gl, void *(*get_fn)(void *ctx, const char *n),
                         section->extension ? section->extension : "builtin",
                         MPGL_VER_GET_MAJOR(ver_core),
                         MPGL_VER_GET_MINOR(ver_core));
-                if (must_exist) {
-                    gl->mpgl_caps = 0;
+                if (must_exist)
                     goto error;
-                }
                 break;
             }
             assert(i < MAX_FN_COUNT);
@@ -464,6 +430,8 @@ void mpgl_load_functions2(GL *gl, void *(*get_fn)(void *ctx, const char *n),
                 if (loaded[i] && !*funcptr)
                     *funcptr = loaded[i];
             }
+            mp_verbose(log, "Loaded functions for %d/%s.\n", ver_core,
+                       section->extension ? section->extension : "builtin");
         }
     }
 
@@ -486,15 +454,9 @@ void mpgl_load_functions2(GL *gl, void *(*get_fn)(void *ctx, const char *n),
             gl->glsl_version = 150;
     }
 
-    if (is_software_gl(gl))
+    if (is_software_gl(gl)) {
         gl->mpgl_caps |= MPGL_CAP_SW;
-
-    if (gl->mpgl_caps) {
-        mp_verbose(log, "Detected OpenGL features:\n");
-        for (const struct feature *f = &features[0]; f->id; f++) {
-            if ((f->id & gl->mpgl_caps))
-                mp_verbose(log, "  - %s\n", f->name);
-        }
+        mp_verbose(log, "Detected suspected software renderer.\n");
     }
 
     // Provided for simpler handling if no framebuffer support is available.
@@ -529,9 +491,10 @@ struct backend {
 };
 
 extern const struct mpgl_driver mpgl_driver_x11;
+extern const struct mpgl_driver mpgl_driver_x11egl;
 
 static const struct backend backends[] = {
-#if HAVE_RPI_GLES
+#if HAVE_RPI
     {"rpi", mpgl_set_backend_rpi},
 #endif
 #if HAVE_GL_COCOA
@@ -549,7 +512,7 @@ static const struct backend backends[] = {
     {.driver = &mpgl_driver_x11},
 #endif
 #if HAVE_EGL_X11
-    {"x11egl", mpgl_set_backend_x11egl},
+    {.driver = &mpgl_driver_x11egl},
 #endif
     {0}
 };

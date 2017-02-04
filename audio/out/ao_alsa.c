@@ -101,7 +101,7 @@ static int control(struct ao *ao, enum aocontrol cmd, void *arg)
         long get_vol, set_vol;
         float f_multi;
 
-        if (AF_FORMAT_IS_SPECIAL(ao->format))
+        if (!af_fmt_is_pcm(ao->format))
             return CONTROL_FALSE;
 
         snd_mixer_selem_id_alloca(&sid);
@@ -376,7 +376,7 @@ static int try_open_device(struct ao *ao, const char *device)
     struct priv *p = ao->priv;
     int err;
 
-    if (AF_FORMAT_IS_IEC61937(ao->format)) {
+    if (af_fmt_is_spdif(ao->format)) {
         void *tmp = talloc_new(NULL);
         char *params = talloc_asprintf(tmp,
                         "AES0=%d,AES1=%d,AES2=0,AES3=%d",
@@ -453,7 +453,7 @@ static int init_device(struct ao *ao, bool second_try)
     err = snd_pcm_hw_params_any(p->alsa, alsa_hwparams);
     CHECK_ALSA_ERROR("Unable to get initial parameters");
 
-    if (AF_FORMAT_IS_IEC61937(ao->format)) {
+    if (af_fmt_is_spdif(ao->format)) {
         if (ao->format == AF_FORMAT_S_MP3) {
             p->alsa_fmt = SND_PCM_FORMAT_MPEG;
         } else {
@@ -469,7 +469,7 @@ static int init_device(struct ao *ao, bool second_try)
 
     err = snd_pcm_hw_params_test_format(p->alsa, alsa_hwparams, p->alsa_fmt);
     if (err < 0) {
-        if (AF_FORMAT_IS_IEC61937(ao->format))
+        if (af_fmt_is_spdif(ao->format))
             CHECK_ALSA_ERROR("Unable to set IEC61937 format");
         MP_INFO(ao, "Format %s is not supported by hardware, trying default.\n",
                 af_fmt_to_str(ao->format));
@@ -480,11 +480,11 @@ static int init_device(struct ao *ao, bool second_try)
     err = snd_pcm_hw_params_set_format(p->alsa, alsa_hwparams, p->alsa_fmt);
     CHECK_ALSA_ERROR("Unable to set format");
 
-    snd_pcm_access_t access = AF_FORMAT_IS_PLANAR(ao->format)
+    snd_pcm_access_t access = af_fmt_is_planar(ao->format)
                                     ? SND_PCM_ACCESS_RW_NONINTERLEAVED
                                     : SND_PCM_ACCESS_RW_INTERLEAVED;
     err = snd_pcm_hw_params_set_access(p->alsa, alsa_hwparams, access);
-    if (err < 0 && AF_FORMAT_IS_PLANAR(ao->format)) {
+    if (err < 0 && af_fmt_is_planar(ao->format)) {
         ao->format = af_fmt_from_planar(ao->format);
         access = SND_PCM_ACCESS_RW_INTERLEAVED;
         err = snd_pcm_hw_params_set_access(p->alsa, alsa_hwparams, access);
@@ -492,7 +492,7 @@ static int init_device(struct ao *ao, bool second_try)
     CHECK_ALSA_ERROR("Unable to set access type");
 
     struct mp_chmap dev_chmap = ao->channels;
-    if (AF_FORMAT_IS_IEC61937(ao->format) || p->cfg_ignore_chmap) {
+    if (af_fmt_is_spdif(ao->format) || p->cfg_ignore_chmap) {
         dev_chmap.num = 0; // disable chmap API
     } else if (dev_chmap.num == 1 && dev_chmap.speaker[0] == MP_SPEAKER_ID_FC) {
         // As yet another ALSA API inconsistency, mono is not reported correctly.
@@ -571,10 +571,11 @@ static int init_device(struct ao *ao, bool second_try)
 
         err = snd_pcm_set_chmap(p->alsa, alsa_chmap);
         if (err == -ENXIO) {
-            // I consider this an ALSA bug: the channel map was reported as
-            // supported, but we still can't set it. It happens virtually
-            // always with dmix, though.
-            MP_VERBOSE(ao, "Device does not support requested channel map (%s)\n",
+            // A device my not be able to set any channel map, even channel maps
+            // that were reported as supported. This is either because the ALSA
+            // device is broken (dmix), or because the driver has only 1
+            // channel map per channel count, and setting the map is not needed.
+            MP_VERBOSE(ao, "device returned ENXIO when setting channel map %s\n",
                        mp_chmap_to_str(&dev_chmap));
         } else {
             CHECK_ALSA_WARN("Channel map setup failed");
@@ -596,7 +597,7 @@ static int init_device(struct ao *ao, bool second_try)
 
         if (p->cfg_ignore_chmap) {
             MP_VERBOSE(ao, "user set ignore-chmap; ignoring the channel map.\n");
-        } else if (AF_FORMAT_IS_IEC61937(ao->format)) {
+        } else if (af_fmt_is_spdif(ao->format)) {
             MP_VERBOSE(ao, "using spdif passthrough; ignoring the channel map.\n");
         } else if (mp_chmap_is_valid(&chmap)) {
             // Is it one that contains NA channels?
@@ -848,7 +849,7 @@ static int play(struct ao *ao, void **data, int samples, int flags)
         return 0;
 
     do {
-        if (AF_FORMAT_IS_PLANAR(ao->format)) {
+        if (af_fmt_is_planar(ao->format)) {
             res = snd_pcm_writen(p->alsa, data, samples);
         } else {
             res = snd_pcm_writei(p->alsa, data[0], samples);
@@ -922,15 +923,18 @@ static void list_devs(struct ao *ao, struct ao_device_list *list)
         char *name = snd_device_name_get_hint(hints[n], "NAME");
         char *desc = snd_device_name_get_hint(hints[n], "DESC");
         char *io = snd_device_name_get_hint(hints[n], "IOID");
-        if (io && strcmp(io, "Output") != 0)
-            continue;
-        char desc2[1024];
-        snprintf(desc2, sizeof(desc2), "%s", desc ? desc : "");
-        for (int i = 0; desc2[i]; i++) {
-            if (desc2[i] == '\n')
-                desc2[i] = '/';
+        if (io && strcmp(io, "Output") == 0) {
+            char desc2[1024];
+            snprintf(desc2, sizeof(desc2), "%s", desc ? desc : "");
+            for (int i = 0; desc2[i]; i++) {
+                if (desc2[i] == '\n')
+                    desc2[i] = '/';
+            }
+            ao_device_list_add(list, ao, &(struct ao_device_desc){name, desc2});
         }
-        ao_device_list_add(list, ao, &(struct ao_device_desc){name, desc2});
+        free(name);
+        free(desc);
+        free(io);
     }
 
     snd_device_name_free_hint(hints);

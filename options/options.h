@@ -42,7 +42,10 @@ typedef struct mp_vo_opts {
     float monitor_pixel_aspect;
     int force_window_position;
 
+    // vo_wayland, vo_drm
     struct sws_opts *sws_opts;
+    // vo_opengl, vo_opengl_cb
+    int hwdec_preload_api;
 } mp_vo_opts;
 
 struct mp_cache_opts {
@@ -50,6 +53,7 @@ struct mp_cache_opts {
     int def_size;
     int initial;
     int seek_min;
+    int back_buffer;
     char *file;
     int file_max;
 };
@@ -140,6 +144,9 @@ typedef struct MPOpts {
     int correct_pts;
     int user_pts_assoc_mode;
     int initial_audio_sync;
+    int video_sync;
+    double sync_max_video_change;
+    double sync_max_audio_change;
     int hr_seek;
     float hr_seek_demuxer_offset;
     int hr_seek_framedrop;
@@ -160,6 +167,7 @@ typedef struct MPOpts {
     float heartbeat_interval;
     int player_idle_mode;
     int consolecontrols;
+    int playlist_pos;
     struct m_rel_time play_start;
     struct m_rel_time play_end;
     struct m_rel_time play_length;
@@ -184,18 +192,20 @@ typedef struct MPOpts {
     float sub_speed;
     int forced_subs_only;
     int stretch_dvd_subs;
+    int stretch_image_subs;
 
     int sub_fix_timing;
     char *sub_cp;
 
     char **audio_files;
     char *demuxer_name;
+    int demuxer_max_packs;
+    int demuxer_max_bytes;
     int demuxer_thread;
-    int demuxer_min_packs;
-    int demuxer_min_bytes;
     double demuxer_min_secs;
     char *audio_demuxer_name;
     char *sub_demuxer_name;
+    int force_seekable;
 
     double demuxer_min_secs_cache;
     int cache_pausing;
@@ -217,6 +227,7 @@ typedef struct MPOpts {
     struct m_obj_settings *af_settings, *af_defs;
     int deinterlace;
     float movie_aspect;
+    int aspect_method;
     int field_dominance;
     char **sub_name;
     char **sub_paths;

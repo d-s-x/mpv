@@ -38,6 +38,7 @@
 #include "common/common.h"
 #include "stream/stream.h"
 #include "video/csputils.h"
+#include "video/hwdec.h"
 #include "sub/osd.h"
 #include "audio/mixer.h"
 #include "audio/filter/af.h"
@@ -78,6 +79,19 @@ extern const struct m_obj_list vf_obj_list;
 extern const struct m_obj_list af_obj_list;
 extern const struct m_obj_list vo_obj_list;
 extern const struct m_obj_list ao_obj_list;
+
+const struct m_opt_choice_alternatives mp_hwdec_names[] = {
+    {"no",          HWDEC_NONE},
+    {"auto",        HWDEC_AUTO},
+    {"vdpau",       HWDEC_VDPAU},
+    {"vda",         HWDEC_VDA},
+    {"videotoolbox",HWDEC_VIDEOTOOLBOX},
+    {"vaapi",       HWDEC_VAAPI},
+    {"vaapi-copy",  HWDEC_VAAPI_COPY},
+    {"dxva2-copy",  HWDEC_DXVA2_COPY},
+    {"rpi",         HWDEC_RPI},
+    {0}
+};
 
 #define OPT_BASE_STRUCT struct MPOpts
 
@@ -143,6 +157,7 @@ const m_option_t mp_opts[] = {
                       ({"no", 0})),
     OPT_INTRANGE("cache-initial", stream_cache.initial, 0, 0, 0x7fffffff),
     OPT_INTRANGE("cache-seek-min", stream_cache.seek_min, 0, 0, 0x7fffffff),
+    OPT_INTRANGE("cache-backbuffer", stream_cache.back_buffer, 0, 0, 0x7fffffff),
     OPT_STRING("cache-file", stream_cache.file, M_OPT_FILE),
     OPT_INTRANGE("cache-file-size", stream_cache.file_max, 0, 0, 0x7fffffff),
 
@@ -185,6 +200,8 @@ const m_option_t mp_opts[] = {
     OPT_TIME("ab-loop-a", ab_loop[0], 0, .min = MP_NOPTS_VALUE),
     OPT_TIME("ab-loop-b", ab_loop[1], 0, .min = MP_NOPTS_VALUE),
 
+    OPT_CHOICE_OR_INT("playlist-pos", playlist_pos, 0, 0, INT_MAX, ({"no", -1})),
+
     OPT_FLAG("pause", pause, M_OPT_FIXED),
     OPT_CHOICE("keep-open", keep_open, 0,
                ({"no", 0},
@@ -210,8 +227,8 @@ const m_option_t mp_opts[] = {
     OPT_CHOICE("audio-display", audio_display, 0,
                ({"no", 0}, {"attachment", 1})),
 
-    OPT_CHOICE("hls-bitrate", hls_bitrate, 0,
-               ({"no", 0}, {"min", 1}, {"max", 2})),
+    OPT_CHOICE_OR_INT("hls-bitrate", hls_bitrate, 0, 0, INT_MAX,
+                      ({"no", -1}, {"min", 0}, {"max", INT_MAX})),
 
     OPT_STRINGLIST("display-tags*", display_tags, 0),
 
@@ -227,8 +244,10 @@ const m_option_t mp_opts[] = {
     OPT_STRING("sub-demuxer", sub_demuxer_name, 0),
     OPT_FLAG("demuxer-thread", demuxer_thread, 0),
     OPT_DOUBLE("demuxer-readahead-secs", demuxer_min_secs, M_OPT_MIN, .min = 0),
-    OPT_INTRANGE("demuxer-readahead-packets", demuxer_min_packs, 0, 0, MAX_PACKS),
-    OPT_INTRANGE("demuxer-readahead-bytes", demuxer_min_bytes, 0, 0, MAX_PACK_BYTES),
+    OPT_INTRANGE("demuxer-max-packets", demuxer_max_packs, 0, 0, INT_MAX),
+    OPT_INTRANGE("demuxer-max-bytes", demuxer_max_bytes, 0, 0, INT_MAX),
+
+    OPT_FLAG("force-seekable", force_seekable, 0),
 
     OPT_DOUBLE("cache-secs", demuxer_min_secs_cache, M_OPT_MIN, .min = 0),
     OPT_FLAG("cache-pause", cache_pausing, 0),
@@ -283,15 +302,8 @@ const m_option_t mp_opts[] = {
 
     OPT_FLAG("ad-spdif-dtshd", dtshd, 0),
 
-    OPT_CHOICE("hwdec", hwdec_api, 0,
-               ({"no", 0},
-                {"auto", -1},
-                {"vdpau", 1},
-                {"vda", 2},
-                {"vaapi", 4},
-                {"vaapi-copy", 5},
-                {"dxva2-copy", 6},
-                {"rpi", 7})),
+    OPT_CHOICE_C("hwdec", hwdec_api, 0, mp_hwdec_names),
+    OPT_CHOICE_C("hwdec-preload", vo.hwdec_preload_api, 0, mp_hwdec_names),
     OPT_STRING("hwdec-codecs", hwdec_codecs, 0),
 
     OPT_SUBSTRUCT("sws", vo.sws_opts, sws_conf, 0),
@@ -300,6 +312,8 @@ const m_option_t mp_opts[] = {
     //  0 means square pixels
     OPT_FLOATRANGE("video-aspect", movie_aspect, 0, -1.0, 10.0),
     OPT_FLOAT_STORE("no-video-aspect", movie_aspect, 0, 0.0),
+    OPT_CHOICE("video-aspect-method", aspect_method, 0,
+               ({"hybrid", 0}, {"bitstream", 1}, {"container", 2})),
 
     OPT_CHOICE("field-dominance", field_dominance, 0,
                ({"auto", -1}, {"top", 0}, {"bottom", 1})),
@@ -323,6 +337,7 @@ const m_option_t mp_opts[] = {
     OPT_FLAG("sub-visibility", sub_visibility, 0),
     OPT_FLAG("sub-forced-only", forced_subs_only, 0),
     OPT_FLAG("stretch-dvd-subs", stretch_dvd_subs, 0),
+    OPT_FLAG("stretch-image-subs-to-screen", stretch_image_subs, 0),
     OPT_FLAG("sub-fix-timing", sub_fix_timing, 0),
     OPT_CHOICE("sub-auto", sub_auto, 0,
                ({"no", -1}, {"exact", 0}, {"fuzzy", 1}, {"all", 2})),
@@ -507,6 +522,18 @@ const m_option_t mp_opts[] = {
     OPT_CHOICE("pts-association-mode", user_pts_assoc_mode, 0,
                ({"auto", 0}, {"decoder", 1}, {"sort", 2})),
     OPT_FLAG("initial-audio-sync", initial_audio_sync, 0),
+    OPT_CHOICE("video-sync", video_sync, 0,
+               ({"audio", VS_DEFAULT},
+                {"display-resample", VS_DISP_RESAMPLE},
+                {"display-resample-vdrop", VS_DISP_RESAMPLE_VDROP},
+                {"display-resample-desync", VS_DISP_RESAMPLE_NONE},
+                {"display-vdrop", VS_DISP_VDROP},
+                {"display-desync", VS_DISP_NONE},
+                {"desync", VS_NONE})),
+    OPT_DOUBLE("video-sync-max-video-change", sync_max_video_change,
+               M_OPT_MIN, .min = 0),
+    OPT_DOUBLE("video-sync-max-audio-change", sync_max_audio_change,
+               M_OPT_MIN | M_OPT_MAX, .min = 0, .max = 1),
     OPT_CHOICE("hr-seek", hr_seek, 0,
                ({"no", -1}, {"absolute", 0}, {"yes", 1}, {"always", 1})),
     OPT_FLOAT("hr-seek-demuxer-offset", hr_seek_demuxer_offset, 0),
@@ -606,7 +633,7 @@ const m_option_t mp_opts[] = {
     OPT_REPLACED("sub", "sub-file"),
     OPT_REPLACED("subcp", "sub-codepage"),
     OPT_REPLACED("subdelay", "sub-delay"),
-    OPT_REPLACED("subfile", "sub"),
+    OPT_REPLACED("subfile", "sub-file"),
     OPT_REPLACED("subfont-text-scale", "sub-scale"),
     OPT_REPLACED("subfont", "sub-text-font"),
     OPT_REPLACED("subfps", "sub-fps"),
@@ -665,7 +692,7 @@ const struct MPOpts mp_default_opts = {
         .window_scale = 1.0,
     },
     .allow_win_drag = 1,
-    .wintitle = "mpv - ${?media-title:${media-title}}${!media-title:No file.}",
+    .wintitle = "${?media-title:${media-title}}${!media-title:No file} - mpv",
     .heartbeat_interval = 30.0,
     .stop_screensaver = 1,
     .cursor_autohide_delay = 1000,
@@ -699,22 +726,25 @@ const struct MPOpts mp_default_opts = {
     .chapter_merge_threshold = 100,
     .chapter_seek_threshold = 5.0,
     .hr_seek_framedrop = 1,
+    .sync_max_video_change = 1,
+    .sync_max_audio_change = 0.125,
     .load_config = 1,
     .position_resume = 1,
     .stream_cache = {
         .size = -1,
-        .def_size = 150000,
+        .def_size = 75000,
         .initial = 0,
         .seek_min = 500,
+        .back_buffer = 75000,
         .file_max = 1024 * 1024,
     },
+    .demuxer_max_packs = 16000,
+    .demuxer_max_bytes = 400 * 1024 * 1024,
     .demuxer_thread = 1,
-    .demuxer_min_packs = 0,
-    .demuxer_min_bytes = 0,
     .demuxer_min_secs = 1.0,
     .network_rtsp_transport = 2,
     .network_timeout = 0.0,
-    .hls_bitrate = 2,
+    .hls_bitrate = INT_MAX,
     .demuxer_min_secs_cache = 10.0,
     .cache_pausing = 1,
     .chapterrange = {-1, -1},
@@ -728,6 +758,7 @@ const struct MPOpts mp_default_opts = {
     .term_osd = 2,
     .term_osd_bar_chars = "[-+-]",
     .consolecontrols = 1,
+    .playlist_pos = -1,
     .play_frames = -1,
     .keep_open = 0,
     .stream_id = { { [STREAM_AUDIO] = -1,

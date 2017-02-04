@@ -227,7 +227,7 @@ void mixer_setbalance(struct mixer *mixer, float val)
         return;
     }
 
-    /* make all other channels pass thru since by default pan blocks all */
+    /* make all other channels pass through since by default pan blocks all */
     for (int i = 2; i < AF_NCH; i++) {
         float level[AF_NCH] = {0};
         level[i] = 1.f;
@@ -317,7 +317,7 @@ static void restore_volume(struct mixer *mixer)
         char drv[40];
         float v_l, v_r;
         int m;
-        if (sscanf(data, "%39[^:]:%f:%f:%d", drv, &v_l, &v_r, &m) == 5) {
+        if (sscanf(data, "%39[^:]:%f:%f:%d", drv, &v_l, &v_r, &m) == 4) {
             if (strcmp(mixer->driver, drv) == 0) {
                 force_vol_l = v_l;
                 force_vol_r = v_r;

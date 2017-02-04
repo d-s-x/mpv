@@ -204,8 +204,8 @@ static int64_t mp_seek(void *opaque, int64_t pos, int whence)
     int64_t current_pos;
     MP_TRACE(demuxer, "mp_seek(%p, %"PRId64", %d)\n", stream, pos, whence);
     if (whence == SEEK_END || whence == AVSEEK_SIZE) {
-        int64_t end;
-        if (stream_control(stream, STREAM_CTRL_GET_SIZE, &end) != STREAM_OK)
+        int64_t end = stream_get_size(stream);
+        if (end < 0)
             return -1;
         if (whence == AVSEEK_SIZE)
             return end;
@@ -521,8 +521,6 @@ static void handle_stream(demuxer_t *demuxer, int i)
             break;
         sh_audio_t *sh_audio = sh->audio;
 
-        sh->format = codec->codec_tag;
-
         // probably unneeded
         mp_chmap_set_unknown(&sh_audio->channels, codec->channels);
         if (codec->channel_layout)
@@ -550,7 +548,6 @@ static void handle_stream(demuxer_t *demuxer, int i)
             }
         }
 
-        sh->format = codec->codec_tag;
         sh_video->disp_w = codec->width;
         sh_video->disp_h = codec->height;
         /* Try to make up some frame rate value, even if it's not reliable.
@@ -578,9 +575,11 @@ static void handle_stream(demuxer_t *demuxer, int i)
                     / (float)(codec->height * codec->sample_aspect_ratio.den);
 
         uint8_t *sd = av_stream_get_side_data(st, AV_PKT_DATA_DISPLAYMATRIX, NULL);
-        if (sd)
-            sh_video->rotate = -av_display_rotation_get((uint32_t *)sd);
-        sh_video->rotate = ((sh_video->rotate % 360) + 360) % 360;
+        if (sd) {
+            double r = av_display_rotation_get((uint32_t *)sd);
+            if (!isnan(r))
+                sh_video->rotate = (((int)(-r) % 360) + 360) % 360;
+        }
 
         // This also applies to vfw-muxed mkv, but we can't detect these easily.
         sh_video->avi_dts = matches_avinputformat_name(priv, "avi");
@@ -595,9 +594,9 @@ static void handle_stream(demuxer_t *demuxer, int i)
         sh_sub = sh->sub;
 
         if (codec->extradata_size) {
-            sh_sub->extradata = talloc_size(sh, codec->extradata_size);
-            memcpy(sh_sub->extradata, codec->extradata, codec->extradata_size);
-            sh_sub->extradata_len = codec->extradata_size;
+            sh->extradata = talloc_size(sh, codec->extradata_size);
+            memcpy(sh->extradata, codec->extradata, codec->extradata_size);
+            sh->extradata_size = codec->extradata_size;
         }
 
         if (matches_avinputformat_name(priv, "microdvd")) {
@@ -621,9 +620,8 @@ static void handle_stream(demuxer_t *demuxer, int i)
         AVDictionaryEntry *mt = av_dict_get(st->metadata, "mimetype", NULL, 0);
         char *mimetype = mt ? mt->value : NULL;
         if (mimetype) {
-            demuxer_add_attachment(demuxer, bstr0(filename), bstr0(mimetype),
-                                   (struct bstr){codec->extradata,
-                                                 codec->extradata_size});
+            demuxer_add_attachment(demuxer, filename, mimetype,
+                                   codec->extradata, codec->extradata_size);
         }
         break;
     }
@@ -636,10 +634,13 @@ static void handle_stream(demuxer_t *demuxer, int i)
     if (sh) {
         sh->ff_index = st->index;
         sh->codec = mp_codec_from_av_codec_id(codec->codec_id);
+        sh->codec_tag = codec->codec_tag;
         sh->lav_headers = codec;
 
         if (st->disposition & AV_DISPOSITION_DEFAULT)
-            sh->default_track = 1;
+            sh->default_track = true;
+        if (st->disposition & AV_DISPOSITION_FORCED)
+            sh->forced_track = true;
         if (priv->format_hack.use_stream_ids)
             sh->demuxer_id = st->id;
         AVDictionaryEntry *title = av_dict_get(st->metadata, "title", NULL, 0);
@@ -810,7 +811,7 @@ static int demux_open_lavf(demuxer_t *demuxer, enum demux_check check)
     for (i = 0; i < avfc->nb_chapters; i++) {
         AVChapter *c = avfc->chapters[i];
         t = av_dict_get(c->metadata, "title", NULL, 0);
-        int index = demuxer_add_chapter(demuxer, t ? bstr0(t->value) : bstr0(""),
+        int index = demuxer_add_chapter(demuxer, t ? t->value : "",
                                         c->start * av_q2d(c->time_base), i);
         mp_tags_copy_from_av_dictionary(demuxer->chapters[index].metadata, c->metadata);
     }
@@ -916,8 +917,7 @@ static void demux_seek_lavf(demuxer_t *demuxer, double rel_seek_secs, int flags)
 
     if (flags & SEEK_FACTOR) {
         struct stream *s = demuxer->stream;
-        int64_t end = 0;
-        stream_control(s, STREAM_CTRL_GET_SIZE, &end);
+        int64_t end = stream_get_size(s);
         if (end > 0 && demuxer->ts_resets_possible &&
             !(priv->avif_flags & AVFMT_NO_BYTE_SEEK))
         {

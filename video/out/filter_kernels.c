@@ -113,7 +113,8 @@ static double sample_filter(struct filter_kernel *filter,
     double w = window->weight ? window->weight(window, x/bw * window->radius
                                                             / filter->f.radius)
                               : 1.0;
-    return c < filter->f.radius ? w * filter->f.weight(&filter->f, c) : 0.0;
+    double v = c < filter->f.radius ? w * filter->f.weight(&filter->f, c) : 0.0;
+    return filter->clamp ? fmax(0.0, fmin(1.0, v)) : v;
 }
 
 // Calculate the 1D filtering kernel for N sample points.
@@ -370,7 +371,7 @@ const struct filter_kernel mp_filter_kernels[] = {
     {{"robidouxsharp",  2,   cubic_bc, .params = {0.2620, 0.3690} }},
     {{"ewa_robidoux",       2,   cubic_bc, .params = {0.3782, 0.3109}}, .polar = true},
     {{"ewa_robidouxsharp",  2,   cubic_bc, .params = {0.2620, 0.3690}}, .polar = true},
-    // Miscalleaneous filters
+    // Miscellaneous filters
     {{"box",            1,   box, .resizable = true}},
     {{"nearest",        0.5, box}},
     {{"triangle",       1,   triangle, .resizable = true}},

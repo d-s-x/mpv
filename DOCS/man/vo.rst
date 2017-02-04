@@ -75,12 +75,6 @@ Available video output drivers are:
         not responding quickly enough if video FPS is close to or higher than
         the display refresh rate.
 
-``x11`` (X11 only)
-    Shared memory video output driver without hardware acceleration that works
-    whenever X11 is present.
-
-    .. note:: This is a fallback only, and should not be normally used.
-
 ``vdpau`` (X11 only)
     Uses the VDPAU interface to display and optionally also decode video.
     Hardware decoding is used with ``--hwdec=vdpau``.
@@ -461,6 +455,11 @@ Available video output drivers are:
         Unfortunately, this can lead to flicker on LCD displays, since these
         have a high reaction time.
 
+    ``temporal-dither-period=<1-128>``
+        Determines how often the dithering pattern is updated when
+        ``temporal-dither`` is in use. 1 (the default) will update on every
+        video frame, 2 on every other frame, etc.
+
     ``debug``
         Check for OpenGL errors, i.e. call ``glGetError()``. Also request a
         debug OpenGL context (which does nothing with current graphics drivers
@@ -503,10 +502,15 @@ Available video output drivers are:
         for ``tscale`` are separable convolution filters (use ``tscale=help``
         to get a list). The default is ``oversample``.
 
-        Note that the maximum supported filter radius is currently 3, and that
-        using filters with larger radius may introduce issues when pausing or
-        framestepping, proportional to the radius used. It is recommended to
-        stick to a radius of 1 or 2.
+        Note that the maximum supported filter radius is currently 3, due to
+        limitations in the number of video textures that can be loaded
+        simultaneously.
+
+    ``tscale-clamp``
+        Clamp the ``tscale`` filter kernel's value range to [0-1]. This reduces
+        excessive ringing artifacts in the temporal domain (which typically
+        manifest themselves as short flashes or fringes of black, mostly
+        around moving edges) in exchange for potentially adding more blur.
 
     ``dscale-radius``, ``cscale-radius``, ``tscale-radius``, etc.
         Set filter parameters for ``dscale``, ``cscale`` and ``tscale``,
@@ -622,7 +626,8 @@ Available video output drivers are:
         full screen).
         This may help getting more consistent frame intervals, especially with
         high-fps clips - which might also reduce dropped frames. Typically a
-        value of 1 should be enough since full screen may bypass the DWM.
+        value of ``windowed`` should be enough since full screen may bypass the
+        DWM.
 
         Windows only.
 
@@ -816,7 +821,7 @@ Available video output drivers are:
 
     This is equivalent to::
 
-        --vo=opengl:scale=spline36:cscale=spline36:dscale=mitchell:dither-depth=auto:fancy-downscaling:sigmoid-upscaling
+        --vo=opengl:scale=spline36:cscale=spline36:dscale=mitchell:dither-depth=auto:fancy-downscaling:sigmoid-upscaling:pbo
 
     Note that some cheaper LCDs do dithering that gravely interferes with
     ``opengl``'s dithering. Disabling dithering with ``dither-depth=no`` helps.
@@ -1000,6 +1005,11 @@ Available video output drivers are:
         (default: -10). Note that mpv will also use the 2 layers above the
         selected layer, to handle the window background and OSD. Actual video
         rendering will happen on the layer above the selected layer.
+
+    ``background=<yes|no>``
+        Whether to render a black background behind the video (default: no).
+        Normally it's better to kill the console framebuffer instead, which
+        gives better performance.
 
 ``drm`` (Direct Rendering Manager)
     Video output driver using Kernel Mode Setting / Direct Rendering Manager.

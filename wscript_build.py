@@ -105,7 +105,6 @@ def build(ctx):
         ( "audio/filter/af_channels.c" ),
         ( "audio/filter/af_delay.c" ),
         ( "audio/filter/af_drc.c" ),
-        ( "audio/filter/af_dummy.c" ),
         ( "audio/filter/af_equalizer.c" ),
         ( "audio/filter/af_export.c" ),
         ( "audio/filter/af_extrastereo.c" ),
@@ -171,6 +170,7 @@ def build(ctx):
         ( "demux/demux_disc.c" ),
         ( "demux/demux_edl.c" ),
         ( "demux/demux_lavf.c" ),
+        ( "demux/demux_libarchive.c",            "libarchive" ),
         ( "demux/demux_libass.c",                "libass"),
         ( "demux/demux_mf.c" ),
         ( "demux/demux_mkv.c" ),
@@ -215,7 +215,6 @@ def build(ctx):
         ( "player/client.c" ),
         ( "player/command.c" ),
         ( "player/configfiles.c" ),
-        ( "player/discnav.c" ),
         ( "player/loadfile.c" ),
         ( "player/main.c" ),
         ( "player/misc.c" ),
@@ -249,6 +248,7 @@ def build(ctx):
         ( "stream/stream_edl.c" ),
         ( "stream/stream_file.c" ),
         ( "stream/stream_lavf.c" ),
+        ( "stream/stream_libarchive.c",          "libarchive" ),
         ( "stream/stream_memory.c" ),
         ( "stream/stream_mf.c" ),
         ( "stream/stream_null.c" ),
@@ -294,8 +294,8 @@ def build(ctx):
         ( "video/decode/vaapi.c",                "vaapi-hwaccel" ),
         ( "video/decode/vd_lavc.c" ),
         ( "video/decode/vda.c",                  "vda-hwaccel" ),
+        ( "video/decode/videotoolbox.c",         "videotoolbox-hwaccel" ),
         ( "video/decode/vdpau.c",                "vdpau-hwaccel" ),
-        ( "video/decode/vdpau_old.c",            "vdpau-old-hwaccel" ),
         ( "video/filter/vf.c" ),
         ( "video/filter/vf_buffer.c" ),
         ( "video/filter/vf_crop.c" ),
@@ -321,6 +321,7 @@ def build(ctx):
         ( "video/filter/vf_vapoursynth.c",       "vapoursynth-core" ),
         ( "video/filter/vf_vavpp.c",             "vaapi-vpp"),
         ( "video/filter/vf_vdpaupp.c",           "vdpau" ),
+        ( "video/filter/vf_vdpaurb.c",           "vdpau" ),
         ( "video/filter/vf_yadif.c",             "libavfilter"),
         ( "video/out/aspect.c" ),
         ( "video/out/bitmap_packer.c" ),
@@ -332,10 +333,11 @@ def build(ctx):
         ( "video/out/filter_kernels.c" ),
         ( "video/out/gl_cocoa.c",                "gl-cocoa" ),
         ( "video/out/gl_common.c",               "gl" ),
-        ( "video/out/gl_rpi.c",                  "rpi-gles" ),
+        ( "video/out/gl_rpi.c",                  "rpi" ),
         ( "video/out/gl_hwdec.c",                "gl" ),
+        ( "video/out/gl_hwdec_dxva2.c",          "gl-win32" ),
         ( "video/out/gl_hwdec_vaglx.c",          "vaapi-glx" ),
-        ( "video/out/gl_hwdec_vda.c",            "vda-gl" ),
+        ( "video/out/gl_hwdec_vda.c",            "videotoolbox-vda-gl" ),
         ( "video/out/gl_hwdec_vdpau.c",          "vdpau-gl-x11" ),
         ( "video/out/gl_lcms.c",                 "gl" ),
         ( "video/out/gl_osd.c",                  "gl" ),
@@ -359,7 +361,6 @@ def build(ctx):
         ( "video/out/vo_vaapi.c",                "vaapi" ),
         ( "video/out/vo_vdpau.c",                "vdpau" ),
         ( "video/out/vo_wayland.c",              "wayland" ),
-        ( "video/out/vo_x11.c" ,                 "x11" ),
         ( "video/out/vo_xv.c",                   "xv" ),
         ( "video/out/w32_common.c",              "win32" ),
         ( "video/out/wayland_common.c",          "wayland" ),
@@ -416,6 +417,12 @@ def build(ctx):
             ctx.add_manual_dependency(
                 ctx.path.find_node('osdep/mpv.rc'),
                 ctx.path.find_node(node))
+
+        version = ctx.bldnode.find_node('version.h')
+        if version:
+            ctx.add_manual_dependency(
+                ctx.path.find_node('osdep/mpv.rc'),
+                version)
 
     if ctx.dependency_satisfied('cplayer') or ctx.dependency_satisfied('test'):
         ctx(

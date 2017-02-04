@@ -77,8 +77,6 @@ struct gl_priv {
     char *backend;
     int es;
 
-    bool frame_started;
-
     int frames_rendered;
     unsigned int prev_sgi_sync_count;
 
@@ -124,12 +122,6 @@ static void flip_page(struct vo *vo)
     struct gl_priv *p = vo->priv;
     GL *gl = p->gl;
 
-    if (!p->frame_started) {
-        vo_increment_drop_count(vo, 1);
-        return;
-    }
-    p->frame_started = false;
-
     mpgl_swap_buffers(p->glctx);
 
     p->frames_rendered++;
@@ -164,20 +156,12 @@ static void flip_page(struct vo *vo)
     }
 }
 
-static void draw_image_timed(struct vo *vo, mp_image_t *mpi,
-                             struct frame_timing *t)
+static void draw_frame(struct vo *vo, struct vo_frame *frame)
 {
     struct gl_priv *p = vo->priv;
     GL *gl = p->gl;
 
-    if (mpi)
-        gl_video_set_image(p->renderer, mpi);
-
-    if (p->glctx->start_frame && !p->glctx->start_frame(p->glctx))
-        return;
-
-    p->frame_started = true;
-    gl_video_render_frame(p->renderer, 0, t);
+    gl_video_render_frame(p->renderer, frame, 0);
 
     // The playloop calls this last before waiting some time until it decides
     // to call flip_page(). Tell OpenGL to start execution of the GPU commands
@@ -186,11 +170,6 @@ static void draw_image_timed(struct vo *vo, mp_image_t *mpi,
 
     if (p->use_glFinish)
         gl->Finish();
-}
-
-static void draw_image(struct vo *vo, mp_image_t *mpi)
-{
-    draw_image_timed(vo, mpi, NULL);
 }
 
 static int query_format(struct vo *vo, int format)
@@ -302,9 +281,8 @@ static bool reparse_cmdline(struct gl_priv *p, char *args)
     }
 
     if (r >= 0) {
-        int queue = 0;
-        gl_video_set_options(p->renderer, opts->renderer_opts, &queue);
-        vo_set_flip_queue_params(p->vo, queue, opts->renderer_opts->interpolation);
+        gl_video_set_options(p->renderer, opts->renderer_opts);
+        gl_video_configure_queue(p->renderer, p->vo);
         p->vo->want_redraw = true;
     }
 
@@ -356,12 +334,6 @@ static int control(struct vo *vo, uint32_t request, void *data)
     case VOCTRL_LOAD_HWDEC_API:
         request_hwdec_api(p, data);
         return true;
-    case VOCTRL_REDRAW_FRAME:
-        if (!(p->glctx->start_frame && !p->glctx->start_frame(p->glctx))) {
-            p->frame_started = true;
-            gl_video_render_frame(p->renderer, 0, NULL);
-        }
-        return true;
     case VOCTRL_SET_COMMAND_LINE: {
         char *arg = data;
         return reparse_cmdline(p, arg);
@@ -370,8 +342,10 @@ static int control(struct vo *vo, uint32_t request, void *data)
         gl_video_reset(p->renderer);
         return true;
     case VOCTRL_PAUSE:
-        if (gl_video_showing_interpolated_frame(p->renderer))
+        if (gl_video_showing_interpolated_frame(p->renderer)) {
             vo->want_redraw = true;
+            vo_wakeup(vo);
+        }
         return true;
     }
 
@@ -441,9 +415,8 @@ static int preinit(struct vo *vo)
     gl_video_set_osd_source(p->renderer, vo->osd);
     gl_video_set_output_depth(p->renderer, p->glctx->depth_r, p->glctx->depth_g,
                               p->glctx->depth_b);
-    int queue = 0;
-    gl_video_set_options(p->renderer, p->renderer_opts, &queue);
-    vo_set_flip_queue_params(p->vo, queue, p->renderer_opts->interpolation);
+    gl_video_set_options(p->renderer, p->renderer_opts);
+    gl_video_configure_queue(p->renderer, vo);
 
     p->cms = gl_lcms_init(p, vo->log, vo->global);
     if (!p->cms)
@@ -454,6 +427,14 @@ static int preinit(struct vo *vo)
 
     p->hwdec_info.load_api = call_request_hwdec_api;
     p->hwdec_info.load_api_ctx = vo;
+
+    if (vo->opts->hwdec_preload_api != HWDEC_NONE) {
+        p->hwdec =
+            gl_hwdec_load_api_id(p->vo->log, p->gl, vo->opts->hwdec_preload_api);
+        gl_video_set_hwdec(p->renderer, p->hwdec);
+        if (p->hwdec)
+            p->hwdec_info.hwctx = p->hwdec->hwctx;
+    }
 
     return 0;
 
@@ -490,8 +471,7 @@ const struct vo_driver video_out_opengl = {
     .query_format = query_format,
     .reconfig = reconfig,
     .control = control,
-    .draw_image = draw_image,
-    .draw_image_timed = draw_image_timed,
+    .draw_frame = draw_frame,
     .flip_page = flip_page,
     .uninit = uninit,
     .priv_size = sizeof(struct gl_priv),
@@ -506,8 +486,7 @@ const struct vo_driver video_out_opengl_hq = {
     .query_format = query_format,
     .reconfig = reconfig,
     .control = control,
-    .draw_image = draw_image,
-    .draw_image_timed = draw_image_timed,
+    .draw_frame = draw_frame,
     .flip_page = flip_page,
     .uninit = uninit,
     .priv_size = sizeof(struct gl_priv),

@@ -1193,7 +1193,7 @@ static void getproperty_fn(void *arg)
         char *s = NULL;
         err = mp_property_do(req->name, M_PROPERTY_GET_STRING, &s, req->mpctx);
         if (err == M_PROPERTY_OK)
-            *(char **)req->data = s;
+            *(char **)data = s;
         break;
     }
     case MPV_FORMAT_NODE:
@@ -1523,6 +1523,9 @@ int mpv_request_log_messages(mpv_handle *ctx, const char *min_level)
             break;
         }
     }
+    if (strcmp(min_level, "terminal-default") == 0)
+        level = MP_LOG_BUFFER_MSGL_TERM;
+
     if (level < 0 && strcmp(min_level, "no") != 0)
         return MPV_ERROR_INVALID_PARAMETER;
 
@@ -1547,6 +1550,7 @@ static bool gen_log_message_event(struct mpv_handle *ctx)
         if (msg) {
             struct mpv_event_log_message *cmsg =
                 talloc_ptrtype(ctx->cur_event, cmsg);
+            talloc_steal(cmsg, msg);
             *cmsg = (struct mpv_event_log_message){
                 .prefix = msg->prefix,
                 .level = mp_log_levels[msg->level],
@@ -1597,7 +1601,7 @@ static const char *const err_table[] = {
     [-MPV_ERROR_LOADING_FAILED] = "loading failed",
     [-MPV_ERROR_AO_INIT_FAILED] = "audio output initialization failed",
     [-MPV_ERROR_VO_INIT_FAILED] = "audio output initialization failed",
-    [-MPV_ERROR_NOTHING_TO_PLAY] = "the file has no audio or video data",
+    [-MPV_ERROR_NOTHING_TO_PLAY] = "no audio or video data found",
     [-MPV_ERROR_UNKNOWN_FORMAT] = "unrecognized file format",
     [-MPV_ERROR_UNSUPPORTED] = "not supported",
     [-MPV_ERROR_NOT_IMPLEMENTED] = "operation not implemented",

@@ -40,15 +40,11 @@
  * The VAAPI decoder can work only with surfaces passed to the decoder at
  * creation time. This means all surfaces have to be created in advance.
  * So, additionally to the maximum number of reference frames, we need
- * surfaces for:
- * - 1 decode frame
- * - decoding 2 frames ahead (done by generic playback code)
- * - keeping the reference to the previous frame (done by vo_vaapi.c)
- * - keeping the reference to a dropped frame (done by vo.c)
+ * surfaces for all kinds of buffering between decoder and VO.
  * Note that redundant additional surfaces also might allow for some
  * buffering (i.e. not trying to reuse a surface while it's busy).
  */
-#define ADDTIONAL_SURFACES 5
+#define ADDTIONAL_SURFACES 6
 
 // Some upper bound.
 #define MAX_SURFACES 25
@@ -69,6 +65,8 @@ struct priv {
     struct mp_image_pool *sw_pool;
 };
 
+#define HAS_HEVC VA_CHECK_VERSION(0, 38, 0)
+
 #define PE(av_codec_id, ff_profile, vdp_profile)                \
     {AV_CODEC_ID_ ## av_codec_id, FF_PROFILE_ ## ff_profile,    \
      VAProfile ## vdp_profile}
@@ -88,7 +86,7 @@ static const struct hwdec_profile_entry profiles[] = {
     PE(WMV3,        VC1_ADVANCED,       VC1Advanced),
     PE(WMV3,        VC1_MAIN,           VC1Main),
     PE(WMV3,        VC1_SIMPLE,         VC1Simple),
-#if VA_CHECK_VERSION(0, 37, 0)
+#if HAS_HEVC
     PE(HEVC,        HEVC_MAIN,          HEVCMain),
     PE(HEVC,        HEVC_MAIN_10,       HEVCMain10),
 #endif
@@ -111,7 +109,7 @@ static const char *str_va_profile(VAProfile profile)
         PROFILE(VC1Simple);
         PROFILE(VC1Main);
         PROFILE(VC1Advanced);
-#if VA_CHECK_VERSION(0, 37, 0)
+#if HAS_HEVC
         PROFILE(HEVCMain);
         PROFILE(HEVCMain10);
 #endif
@@ -191,7 +189,7 @@ static bool has_profile(VAProfile *va_profiles, int num_profiles, VAProfile p)
     return false;
 }
 
-static int init_decoder(struct lavc_ctx *ctx, int fmt, int w, int h)
+static int init_decoder(struct lavc_ctx *ctx, int w, int h)
 {
     void *tmp = talloc_new(NULL);
 
@@ -282,15 +280,13 @@ error:
     return res;
 }
 
-static struct mp_image *allocate_image(struct lavc_ctx *ctx, int format,
-                                       int w, int h)
+static struct mp_image *allocate_image(struct lavc_ctx *ctx, int w, int h)
 {
     struct priv *p = ctx->hwdec_priv;
 
-    struct mp_image *img =
-        mp_image_pool_get_no_alloc(p->pool, IMGFMT_VAAPI, w, h);
+    struct mp_image *img = mp_image_pool_get(p->pool, IMGFMT_VAAPI, w, h);
     if (!img)
-        MP_ERR(p, "Insufficient number of surfaces.\n");
+        MP_ERR(p, "Failed to allocate additional VAAPI surface.\n");
     return img;
 }
 
@@ -315,7 +311,7 @@ static bool create_va_dummy_ctx(struct priv *p)
     VADisplay *display = vaGetDisplay(p->x11_display);
     if (!display)
         goto destroy_ctx;
-    p->ctx = va_initialize(display, p->log);
+    p->ctx = va_initialize(display, p->log, true);
     if (!p->ctx) {
         vaTerminate(display);
         goto destroy_ctx;

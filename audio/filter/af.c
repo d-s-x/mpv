@@ -31,7 +31,6 @@
 #include "af.h"
 
 // Static list of filters
-extern const struct af_info af_info_dummy;
 extern const struct af_info af_info_delay;
 extern const struct af_info af_info_channels;
 extern const struct af_info af_info_format;
@@ -89,7 +88,6 @@ static const struct af_info *const filter_list[] = {
 #if HAVE_LIBAVFILTER
     &af_info_lavfi,
 #endif
-    &af_info_dummy,
     NULL
 };
 
@@ -352,18 +350,23 @@ static int af_fix_format_conversion(struct af_stream *s,
         return AF_FALSE;
     int dstfmt = in.format;
     char *filter = "lavrresample";
+    if (!af_lavrresample_test_conversion(actual.format, dstfmt))
+        return AF_ERROR;
     if (strcmp(filter, prev->info->name) == 0) {
         if (prev->control(prev, AF_CONTROL_SET_FORMAT, &dstfmt) == AF_OK) {
             *p_af = prev;
             return AF_OK;
         }
+        return AF_ERROR;
     }
     struct af_instance *new = af_prepend(s, af, filter, NULL);
     if (new == NULL)
         return AF_ERROR;
     new->auto_inserted = true;
-    if (AF_OK != (rv = new->control(new, AF_CONTROL_SET_FORMAT, &dstfmt)))
+    if (AF_OK != (rv = new->control(new, AF_CONTROL_SET_FORMAT, &dstfmt))) {
+        af_remove(s, new);
         return rv;
+    }
     *p_af = new;
     return AF_OK;
 }
@@ -488,8 +491,8 @@ static int af_reinit(struct af_stream *s)
             int fmt_in1 = af->prev->data->format;
             int fmt_in2 = in.format;
             if (af_fmt_is_valid(fmt_in1) && af_fmt_is_valid(fmt_in2)) {
-                bool spd1 = AF_FORMAT_IS_IEC61937(fmt_in1);
-                bool spd2 = AF_FORMAT_IS_IEC61937(fmt_in2);
+                bool spd1 = af_fmt_is_spdif(fmt_in1);
+                bool spd2 = af_fmt_is_spdif(fmt_in2);
                 if (spd1 != spd2 && af->next) {
                     MP_WARN(af, "Filter %s apparently cannot be used due to "
                                 "spdif passthrough - removing it.\n",
@@ -514,6 +517,8 @@ static int af_reinit(struct af_stream *s)
                    af->info->name, rv);
             goto error;
         }
+        if (af && !af->auto_inserted)
+            retry = 0;
     }
 
     /* Set previously unset fields in s->output to those of the filter chain
@@ -646,7 +651,7 @@ struct af_instance *af_add(struct af_stream *s, char *name, char *label,
         return NULL;
     new->label = talloc_strdup(new, label);
 
-    // Reinitalize the filter list
+    // Reinitialize the filter list
     if (af_reinit(s) != AF_OK) {
         af_remove_by_label(s, label);
         return NULL;

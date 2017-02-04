@@ -96,10 +96,16 @@ typedef struct mp_image {
 
     int hwdec_type;
 
-    /* memory management */
-    struct m_refcount *refcount;
     /* for private use */
     void* priv;
+
+    // Reference-counted data references.
+    // These do not necessarily map directly to planes[]. They can have
+    // different order or count. There shouldn't be more buffers than planes.
+    // If bufs[n] is NULL, bufs[n+1] must also be NULL.
+    // All mp_* functions manage this automatically; do not mess with it.
+    // (See also AVFrame.buf.)
+    struct AVBufferRef *bufs[MP_MAX_PLANES];
 } mp_image_t;
 
 int mp_chroma_div_up(int size, int shift);
@@ -126,6 +132,7 @@ int mp_image_plane_h(struct mp_image *mpi, int plane);
 void mp_image_setfmt(mp_image_t* mpi, int out_fmt);
 void mp_image_steal_data(struct mp_image *dst, struct mp_image *src);
 
+struct mp_image *mp_image_new_dummy_ref(struct mp_image *img);
 struct mp_image *mp_image_new_custom_ref(struct mp_image *img, void *arg,
                                          void (*free)(void *arg));
 

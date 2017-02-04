@@ -118,10 +118,6 @@ o (also P)
 O
     Toggle OSD states between normal and playback time/duration.
 
-d
-    Toggle frame dropping states: none / skip display / skip decoding (see
-    ``--framedrop``).
-
 v
     Toggle subtitle visibility.
 
@@ -175,7 +171,7 @@ Shift+PGUP and Shift+PGDWN
     Seek backward or forward by 10 minutes. (This used to be mapped to
     PGUP/PGDWN without Shift.)
 
-D
+d
     Activate/deactivate deinterlacer.
 
 A
@@ -309,7 +305,7 @@ Suboptions passed to the client API are also subject to escaping. Using
 command line (but without shell processing of the string). Some options
 support passing values in a more structured way instead of flat strings, and
 can avoid the suboption parsing mess. For example, ``--vf`` supports
-``MPV_FORMAT_NODE``, which let's you pass suboptions as a nested data structure
+``MPV_FORMAT_NODE``, which lets you pass suboptions as a nested data structure
 of maps and arrays. (``--vo`` supports this in the same way, although this
 fact is undocumented.)
 
@@ -420,7 +416,7 @@ but option values still need to be quoted as a whole if it contains certain
 characters like spaces. A config entry can be quoted with ``"`` and ``'``,
 as well as with the fixed-length syntax (``%n%``) mentioned before. This is like
 passing the exact contents of the quoted string as command line option. C-style
-escapes are currently _not_ interpreted on this level, although some options to
+escapes are currently _not_ interpreted on this level, although some options do
 this manually. (This is a mess and should probably be changed at some point.)
 
 Putting Command Line Options into the Configuration File
@@ -530,13 +526,21 @@ listed.
   if there is audio "missing", or not enough frames can be dropped. Usually
   this will indicate a problem. (``total-avsync-change`` property.)
 - Encoding state in ``{...}``, only shown in encoding mode.
+- Display sync state. If display sync is active (``display-sync-active``
+  property), this shows ``DS: +0.02598%``, where the number is the speed change
+  factor applied to audio to achieve sync to display, expressed in percent
+  deviation from 1.0 (``audio-speed-correction`` property). In sync modes which
+  don't resample, this will always be ``+0.00000%``.
+- Missed frames, e.g. ``Missed: 4``. (``vo-missed-frame-count`` property.) Shows
+  up in display sync mode only. This is incremented each time a frame took
+  longer to display than intended.
 - Dropped frames, e.g. ``Dropped: 4``. Shows up only if the count is not 0. Can
   grow if the video framerate is higher than that of the display, or if video
   rendering is too slow. Also can be incremented on "hiccups" and when the video
   frame couldn't be displayed on time. (``vo-drop-frame-count`` property.)
   If the decoder drops frames, the number of decoder-dropped frames is appended
   to the display as well, e.g.: ``Dropped: 4/34``. This happens only if
-  decoder-framedropping is enabled with the ``--framedrop`` options.
+  decoder frame dropping is enabled with the ``--framedrop`` options.
   (``drop-frame-count`` property.)
 - Cache state, e.g. ``Cache:  2s+134KB``. Visible if the stream cache is enabled.
   The first value shows the amount of video buffered in the demuxer in seconds,
@@ -567,13 +571,9 @@ PROTOCOLS
     you must mount the ISO file as filesystem, and point ``--bluray-device``
     to the mounted directory directly.
 
-``bdnav://[title][/device]``
-    Play a Blu-Ray disc, with navigation features enabled. This feature is
-    permanently experimental.
-
 ``dvd://[title|[starttitle]-endtitle][/device]`` ``--dvd-device=PATH``
-    Play a DVD. If you want dvdnav menus, use ``dvd://menu``. If no title
-    is given, the longest title is auto-selected.
+    Play a DVD. DVD menus are not supported. If no title is given, the longest
+    title is auto-selected.
 
     ``dvdnav://`` is an old alias for ``dvd://`` and does exactly the same
     thing.
@@ -617,6 +617,11 @@ PROTOCOLS
     A local path as URL. Might be useful in some special use-cases. Note that
     ``PATH`` itself should start with a third ``/`` to make the path an
     absolute path.
+
+``fd://123``
+    Read data from the given UNIX FD (for example 123). This is similar to
+    piping data to stdin via ``-``, but can use an arbitrary file descriptor.
+    Will not work correctly on MS Windows.
 
 ``edl://[edl specification as in edl-mpv.rst]``
     Stitch together parts of multiple files and play them.
@@ -807,7 +812,8 @@ If errors happen, the following exit codes can be returned:
         immediately after initialization.
     :3: There were some files that could be played, and some files which
         couldn't (using the definition of success from above).
-    :4: The ``quit`` command was issued (default exit code).
+    :4: Quit due to a signal, Ctrl+c in a VO window (by default), or from the
+        default quit key bindings in encoding mode.
 
 Note that quitting the player manually will always lead to exit code 0,
 overriding the exit code that would be returned normally. Also, the ``quit``
@@ -878,6 +884,14 @@ Other config files (such as ``input.conf``) are in the same directory. See the
 
 The environment variable ``$MPV_HOME`` completely overrides these, like on
 UNIX.
+
+If a directory named ``portable_config`` next to the mpv.exe exists, all
+config will be loaded from this directory only. Watch later config files are
+written to this directory as well. (This exists on Windows only and is redundant
+with ``$MPV_HOME``. However, since Windows is very scripting unfriendly, a
+wrapper script just setting ``$MPV_HOME``, like you could do it on other
+systems, won't work. ``portable_config`` is provided for convenience to get
+around this restriction.)
 
 Config files located in the same directory as ``mpv.exe`` are loaded with
 lower priority. Some config files are loaded only once, which means that

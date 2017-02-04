@@ -34,8 +34,8 @@ static void update_redundant_info(struct mp_audio *mpa)
     assert(mp_chmap_is_empty(&mpa->channels) ||
            mp_chmap_is_valid(&mpa->channels));
     mpa->nch = mpa->channels.num;
-    mpa->bps = af_fmt2bps(mpa->format);
-    if (AF_FORMAT_IS_PLANAR(mpa->format)) {
+    mpa->bps = af_fmt_to_bytes(mpa->format);
+    if (af_fmt_is_planar(mpa->format)) {
         mpa->spf = 1;
         mpa->num_planes = mpa->nch;
         mpa->sstride = mpa->bps;
@@ -93,15 +93,19 @@ bool mp_audio_config_valid(const struct mp_audio *mpa)
 
 char *mp_audio_config_to_str_buf(char *buf, size_t buf_sz, struct mp_audio *mpa)
 {
+    char ch[128];
+    mp_chmap_to_str_buf(ch, sizeof(ch), &mpa->channels);
+    char *hr_ch = mp_chmap_to_str_hr(&mpa->channels);
+    if (strcmp(hr_ch, ch) != 0)
+        mp_snprintf_cat(ch, sizeof(ch), " (%s)", hr_ch);
     snprintf(buf, buf_sz, "%dHz %s %dch %s", mpa->rate,
-             mp_chmap_to_str(&mpa->channels), mpa->channels.num,
-             af_fmt_to_str(mpa->format));
+             ch, mpa->channels.num, af_fmt_to_str(mpa->format));
     return buf;
 }
 
 void mp_audio_force_interleaved_format(struct mp_audio *mpa)
 {
-    if (AF_FORMAT_IS_PLANAR(mpa->format))
+    if (af_fmt_is_planar(mpa->format))
         mp_audio_set_format(mpa, af_fmt_from_planar(mpa->format));
 }
 

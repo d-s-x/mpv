@@ -40,6 +40,7 @@
 #include "aspect.h"
 #include "bitmap_packer.h"
 #include "dither.h"
+#include "vo.h"
 
 // Pixel width of 1D lookup textures.
 #define LOOKUP_TEXTURE_SIZE 256
@@ -95,21 +96,17 @@ static const struct gl_vao_entry vertex_vao[] = {
 
 struct texplane {
     int w, h;
-    int tex_w, tex_h;
     GLint gl_internal_format;
     GLenum gl_target;
     GLenum gl_format;
     GLenum gl_type;
     GLuint gl_texture;
     int gl_buffer;
-    int buffer_size;
-    void *buffer_ptr;
 };
 
 struct video_image {
     struct texplane planes[4];
     bool image_flipped;
-    bool needs_upload;
     struct mp_image *mpi;       // original input image
 };
 
@@ -130,8 +127,7 @@ struct scaler {
 
 struct fbosurface {
     struct fbotex fbotex;
-    int64_t pts;
-    double vpts; // used for synchronizing subtitles only
+    double pts;
 };
 
 #define FBOSURFACES_MAX 10
@@ -139,7 +135,7 @@ struct fbosurface {
 struct src_tex {
     GLuint gl_tex;
     GLenum gl_target;
-    int tex_w, tex_h;
+    int w, h;
     struct mp_rect_f src;
 };
 
@@ -195,6 +191,7 @@ struct gl_video {
 
     int surface_idx;
     int surface_now;
+    int frames_drawn;
     bool is_interpolated;
 
     // state for luma (0), luma-down(1), chroma (2) and temporal (3) scalers
@@ -213,7 +210,6 @@ struct gl_video {
     bool use_linear;
     bool use_normalized_range;
     float user_gamma;
-    struct fbotex copy_fbos[4];
 
     int frames_uploaded;
     int frames_rendered;
@@ -333,6 +329,7 @@ static const struct packed_fmt_entry mp_packed_formats[] = {
 const struct gl_video_opts gl_video_opts_def = {
     .dither_depth = -1,
     .dither_size = 6,
+    .temporal_dither_period = 1,
     .fbo_format = GL_RGBA16,
     .sigmoid_center = 0.75,
     .sigmoid_slope = 6.5,
@@ -350,6 +347,7 @@ const struct gl_video_opts gl_video_opts_def = {
 const struct gl_video_opts gl_video_opts_hq_def = {
     .dither_depth = 0,
     .dither_size = 6,
+    .temporal_dither_period = 1,
     .fbo_format = GL_RGBA16,
     .fancy_downscaling = 1,
     .sigmoid_center = 0.75,
@@ -365,6 +363,7 @@ const struct gl_video_opts gl_video_opts_hq_def = {
     .background = {0, 0, 0, 255},
     .gamma = 1.0f,
     .blend_subs = 0,
+    .pbo = 1,
 };
 
 static int validate_scaler_opt(struct mp_log *log, const m_option_t *opt,
@@ -413,6 +412,7 @@ const struct m_sub_options gl_video_conf = {
         OPT_FLOATRANGE("dscale-antiring", scaler[1].antiring, 0, 0.0, 1.0),
         OPT_FLOATRANGE("cscale-antiring", scaler[2].antiring, 0, 0.0, 1.0),
         OPT_FLOATRANGE("tscale-antiring", scaler[3].antiring, 0, 0.0, 1.0),
+        OPT_FLAG("tscale-clamp", scaler[3].clamp, 0),
         OPT_FLAG("scaler-resizes-only", scaler_resizes_only, 0),
         OPT_FLAG("linear-scaling", linear_scaling, 0),
         OPT_FLAG("fancy-downscaling", fancy_downscaling, 0),
@@ -438,6 +438,7 @@ const struct m_sub_options gl_video_conf = {
                    ({"fruit", 0}, {"ordered", 1}, {"no", -1})),
         OPT_INTRANGE("dither-size-fruit", dither_size, 0, 2, 8),
         OPT_FLAG("temporal-dither", temporal_dither, 0),
+        OPT_INTRANGE("temporal-dither-period", temporal_dither_period, 0, 1, 128),
         OPT_CHOICE("alpha", alpha_mode, 0,
                    ({"no", 0},
                     {"yes", 1},
@@ -485,7 +486,7 @@ static void uninit_rendering(struct gl_video *p);
 static void uninit_scaler(struct gl_video *p, struct scaler *scaler);
 static void check_gl_features(struct gl_video *p);
 static bool init_format(int fmt, struct gl_video *init);
-static void gl_video_upload_image(struct gl_video *p);
+static void gl_video_upload_image(struct gl_video *p, struct mp_image *mpi);
 
 #define GLSL(x) gl_sc_add(p->sc, #x "\n");
 #define GLSLF(...) gl_sc_addf(p->sc, __VA_ARGS__)
@@ -524,11 +525,11 @@ void gl_video_set_debug(struct gl_video *p, bool enable)
 static void gl_video_reset_surfaces(struct gl_video *p)
 {
     for (int i = 0; i < FBOSURFACES_MAX; i++) {
-        p->surfaces[i].pts = 0;
-        p->surfaces[i].vpts = MP_NOPTS_VALUE;
+        p->surfaces[i].pts = MP_NOPTS_VALUE;
     }
     p->surface_idx = 0;
     p->surface_now = 0;
+    p->frames_drawn = 0;
 }
 
 static inline int fbosurface_wrap(int id)
@@ -581,9 +582,6 @@ static void uninit_rendering(struct gl_video *p)
     for (int n = 0; n < FBOSURFACES_MAX; n++)
         fbotex_uninit(&p->surfaces[n].fbotex);
 
-    for (int n = 0; n < 4; n++)
-        fbotex_uninit(&p->copy_fbos[n]);
-
     gl_video_reset_surfaces(p);
 }
 
@@ -630,8 +628,8 @@ static void pass_load_fbotex(struct gl_video *p, struct fbotex *src_fbo, int id,
     p->pass_tex[id] = (struct src_tex){
         .gl_tex = src_fbo->texture,
         .gl_target = GL_TEXTURE_2D,
-        .tex_w = src_fbo->tex_w,
-        .tex_h = src_fbo->tex_h,
+        .w = src_fbo->w,
+        .h = src_fbo->h,
         .src = {0, 0, w, h},
     };
 }
@@ -639,7 +637,6 @@ static void pass_load_fbotex(struct gl_video *p, struct fbotex *src_fbo, int id,
 static void pass_set_image_textures(struct gl_video *p, struct video_image *vimg,
                                     struct gl_transform *chroma)
 {
-    GLuint imgtex[4] = {0};
     *chroma = (struct gl_transform){{{0}}};
 
     assert(vimg->mpi);
@@ -662,28 +659,18 @@ static void pass_set_image_textures(struct gl_video *p, struct video_image *vimg
     // Make sure luma/chroma sizes are aligned.
     // Example: For 4:2:0 with size 3x3, the subsampled chroma plane is 2x2
     // so luma (3,3) has to align with chroma (2,2).
-    chroma->m[0][0] = ls_w * (float)vimg->planes[0].tex_w
-                               / vimg->planes[1].tex_w;
-    chroma->m[1][1] = ls_h * (float)vimg->planes[0].tex_h
-                               / vimg->planes[1].tex_h;
-
-    if (p->hwdec_active) {
-        if (p->hwdec->driver->map_image(p->hwdec, vimg->mpi, imgtex) < 0) {
-            for (int n = 0; n < p->plane_count; n++)
-                imgtex[n] = -1;
-        }
-    } else {
-        for (int n = 0; n < p->plane_count; n++)
-            imgtex[n] = vimg->planes[n].gl_texture;
-    }
+    chroma->m[0][0] = ls_w * (float)vimg->planes[0].w
+                               / vimg->planes[1].w;
+    chroma->m[1][1] = ls_h * (float)vimg->planes[0].h
+                               / vimg->planes[1].h;
 
     for (int n = 0; n < p->plane_count; n++) {
         struct texplane *t = &vimg->planes[n];
         p->pass_tex[n] = (struct src_tex){
-            .gl_tex = imgtex[n],
+            .gl_tex = vimg->planes[n].gl_texture,
             .gl_target = t->gl_target,
-            .tex_w = t->tex_w,
-            .tex_h = t->tex_h,
+            .w = t->w,
+            .h = t->h,
             .src = {0, 0, t->w, t->h},
         };
     }
@@ -723,16 +710,16 @@ static void init_video(struct gl_video *p)
 
     struct video_image *vimg = &p->image;
 
+    struct mp_image layout = {0};
+    mp_image_set_params(&layout, &p->image_params);
+
     for (int n = 0; n < p->plane_count; n++) {
         struct texplane *plane = &vimg->planes[n];
 
         plane->gl_target = p->gl_target;
 
-        plane->w = mp_chroma_div_up(p->image_w, p->image_desc.xs[n]);
-        plane->h = mp_chroma_div_up(p->image_h, p->image_desc.ys[n]);
-
-        plane->tex_w = plane->w;
-        plane->tex_h = plane->h;
+        plane->w = mp_image_plane_w(&layout, n);
+        plane->h = mp_image_plane_h(&layout, n);
 
         if (!p->hwdec_active) {
             gl->ActiveTexture(GL_TEXTURE0 + n);
@@ -740,7 +727,7 @@ static void init_video(struct gl_video *p)
             gl->BindTexture(p->gl_target, plane->gl_texture);
 
             gl->TexImage2D(p->gl_target, 0, plane->gl_internal_format,
-                           plane->tex_w, plane->tex_h, 0,
+                           plane->w, plane->h, 0,
                            plane->gl_format, plane->gl_type, NULL);
 
             gl->TexParameteri(p->gl_target, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
@@ -749,8 +736,7 @@ static void init_video(struct gl_video *p)
             gl->TexParameteri(p->gl_target, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         }
 
-        MP_VERBOSE(p, "Texture for plane %d: %dx%d\n",
-                   n, plane->tex_w, plane->tex_h);
+        MP_VERBOSE(p, "Texture for plane %d: %dx%d\n", n, plane->w, plane->h);
     }
     gl->ActiveTexture(GL_TEXTURE0);
 
@@ -770,12 +756,11 @@ static void uninit_video(struct gl_video *p)
     for (int n = 0; n < p->plane_count; n++) {
         struct texplane *plane = &vimg->planes[n];
 
-        gl->DeleteTextures(1, &plane->gl_texture);
+        if (!p->hwdec_active)
+            gl->DeleteTextures(1, &plane->gl_texture);
         plane->gl_texture = 0;
         gl->DeleteBuffers(1, &plane->gl_buffer);
         plane->gl_buffer = 0;
-        plane->buffer_ptr = NULL;
-        plane->buffer_size = 0;
     }
     mp_image_unrefp(&vimg->mpi);
 
@@ -803,8 +788,8 @@ static void pass_prepare_src_tex(struct gl_video *p)
         gl_sc_uniform_sampler(sc, texture_name, s->gl_target, n);
         float f[2] = {1, 1};
         if (s->gl_target != GL_TEXTURE_RECTANGLE) {
-            f[0] = s->tex_w;
-            f[1] = s->tex_h;
+            f[0] = s->w;
+            f[1] = s->h;
         }
         gl_sc_uniform_vec2(sc, texture_size, f);
 
@@ -840,8 +825,8 @@ static void render_pass_quad(struct gl_video *p, int vp_w, int vp_h,
                 if (flags & 4)
                     MPSWAP(float, ty[0], ty[1]);
                 bool rect = s->gl_target == GL_TEXTURE_RECTANGLE;
-                v->texcoord[i].x = tx[n / 2] / (rect ? 1 : s->tex_w);
-                v->texcoord[i].y = ty[n % 2] / (rect ? 1 : s->tex_h);
+                v->texcoord[i].x = tx[n / 2] / (rect ? 1 : s->w);
+                v->texcoord[i].y = ty[n % 2] / (rect ? 1 : s->h);
             }
         }
     }
@@ -887,7 +872,7 @@ static void finish_pass_fbo(struct gl_video *p, struct fbotex *dst_fbo,
 {
     fbotex_change(dst_fbo, p->gl, p->log, w, h, p->opts.fbo_format, flags);
 
-    finish_pass_direct(p, dst_fbo->fbo, dst_fbo->tex_w, dst_fbo->tex_h,
+    finish_pass_direct(p, dst_fbo->fbo, dst_fbo->w, dst_fbo->h,
                        &(struct mp_rect){0, 0, w, h}, 0);
     pass_load_fbotex(p, dst_fbo, tex, w, h);
 }
@@ -913,8 +898,7 @@ static void load_shader(struct gl_video *p, const char *body)
 // Applies an arbitrary number of shaders in sequence, using the given pair
 // of FBOs as intermediate buffers. Returns whether any shaders were applied.
 static bool apply_shaders(struct gl_video *p, char **shaders,
-                          struct fbotex textures[2], int tex_num,
-                          int tex_w, int tex_h)
+                          struct fbotex textures[2], int tex_num, int w, int h)
 {
     if (!shaders)
         return false;
@@ -924,7 +908,7 @@ static bool apply_shaders(struct gl_video *p, char **shaders,
         const char *body = gl_sc_loadfile(p->sc, shaders[n]);
         if (!body)
             continue;
-        finish_pass_fbo(p, &textures[tex], tex_w, tex_h, tex_num, 0);
+        finish_pass_fbo(p, &textures[tex], w, h, tex_num, 0);
         load_shader(p, body);
         GLSLF("// custom shader\n");
         GLSLF("vec4 color = sample(texture%d, texcoord%d, texture_size%d);\n",
@@ -958,7 +942,8 @@ static bool scaler_conf_eq(struct scaler_config a, struct scaler_config b)
     // generation
     return scaler_fun_eq(a.kernel, b.kernel) &&
            scaler_fun_eq(a.window, b.window) &&
-           a.radius == b.radius;
+           a.radius == b.radius &&
+           a.clamp == b.clamp;
 }
 
 static void reinit_scaler(struct gl_video *p, struct scaler *scaler,
@@ -1008,6 +993,8 @@ static void reinit_scaler(struct gl_video *p, struct scaler *scaler,
 
     if (scaler->kernel->f.resizable && conf->radius > 0.0)
         scaler->kernel->f.radius = conf->radius;
+
+    scaler->kernel->clamp = conf->clamp;
 
     scaler->insufficient = !mp_init_filter(scaler->kernel, sizes, scale_factor);
 
@@ -1312,7 +1299,7 @@ static void pass_sample_oversample(struct gl_video *p, struct scaler *scaler,
         GLSLF("coeff = mix(coeff, vec2(0.0), "
               "lessThanEqual(coeff, vec2(%f)));\n", threshold);
         GLSLF("coeff = mix(coeff, vec2(1.0), "
-              "greaterThanEqual(coeff, vec2(%f)));\n", threshold);
+              "greaterThanEqual(coeff, vec2(%f)));\n", 1.0 - threshold);
     }
     // Compute the right blend of colors
     GLSL(vec4 left = mix(texture(tex, baseSW),
@@ -1380,42 +1367,11 @@ static void pass_sample(struct gl_video *p, int src_tex, struct scaler *scaler,
         GLSL(color.a = 1.0;)
 }
 
-static void pass_copy_from_rect(struct gl_video *p)
-{
-    struct src_tex new_pass_tex[TEXUNIT_VIDEO_NUM];
-    assert(sizeof(new_pass_tex) == sizeof(p->pass_tex));
-    memcpy(&new_pass_tex, &p->pass_tex, sizeof(p->pass_tex));
-    memset(&p->pass_tex, 0, sizeof(p->pass_tex));
-
-    for (int n = 0; n < TEXUNIT_VIDEO_NUM; n++) {
-        struct src_tex *src = &new_pass_tex[n];
-        if (src->gl_tex && src->gl_target == GL_TEXTURE_RECTANGLE) {
-            p->pass_tex[0] = (struct src_tex){
-                .gl_tex = src->gl_tex,
-                .gl_target = GL_TEXTURE_RECTANGLE,
-                .tex_w = src->tex_w,
-                .tex_h = src->tex_h,
-                .src = {0, 0, src->tex_w, src->tex_h},
-            };
-            const char *get = p->gl->version < 300 ? "texture2DRect" : "texture";
-            GLSLF("vec4 color = %s(texture0, texcoord0);\n", get);
-            finish_pass_fbo(p, &p->copy_fbos[n], src->tex_w, src->tex_h, 0, 0);
-            src->gl_tex = p->copy_fbos[n].texture;
-            src->gl_target = GL_TEXTURE_2D;
-        }
-    }
-
-    memcpy(&p->pass_tex, &new_pass_tex, sizeof(p->pass_tex));
-}
-
 // sample from video textures, set "color" variable to yuv value
 static void pass_read_video(struct gl_video *p)
 {
     struct gl_transform chromafix;
     pass_set_image_textures(p, &p->image, &chromafix);
-
-    if (p->gl->version < 300 && p->pass_tex[0].gl_target == GL_TEXTURE_RECTANGLE)
-        pass_copy_from_rect(p);
 
     // The custom shader logic is a bit tricky, but there are basically three
     // different places it can occur: RGB, or chroma *and* luma (which are
@@ -1454,6 +1410,7 @@ static void pass_read_video(struct gl_video *p)
 
     // Chroma preprocessing (merging -> shaders -> scaling)
     struct src_tex luma = p->pass_tex[0];
+    struct src_tex alpha = p->pass_tex[3];
     int c_w = p->pass_tex[1].src.x1 - p->pass_tex[1].src.x0;
     int c_h = p->pass_tex[1].src.y1 - p->pass_tex[1].src.y0;
     const struct scaler_config *cscale = &p->opts.scaler[2];
@@ -1514,6 +1471,7 @@ static void pass_read_video(struct gl_video *p)
     }
 
     p->pass_tex[0] = luma; // Restore the luma plane
+    p->pass_tex[3] = alpha; // Restore the alpha plane (if set)
     if (shader) {
         load_shader(p, shader);
         gl_sc_uniform_f(p->sc, "cmul", cmul);
@@ -1926,7 +1884,7 @@ static void pass_dither(struct gl_video *p)
     GLSLF("vec2 dither_pos = gl_FragCoord.xy / %d;\n", p->dither_size);
 
     if (p->opts.temporal_dither) {
-        int phase = p->frames_rendered % 8u;
+        int phase = (p->frames_rendered / p->opts.temporal_dither_period) % 8u;
         float r = phase * (M_PI / 2); // rotate
         float m = phase < 4 ? 1 : -1; // mirror
 
@@ -1983,7 +1941,7 @@ static void pass_draw_osd(struct gl_video *p, int draw_flags, double pts,
 }
 
 // The main rendering function, takes care of everything up to and including
-// upscaling
+// upscaling. p->image is rendered.
 static void pass_render_frame(struct gl_video *p)
 {
     p->use_linear = p->opts.linear_scaling || p->opts.sigmoid_upscaling;
@@ -2063,21 +2021,39 @@ static void pass_draw_to_screen(struct gl_video *p, int fbo)
 }
 
 // Draws an interpolate frame to fbo, based on the frame timing in t
-static void gl_video_interpolate_frame(struct gl_video *p, int fbo,
-                                       struct frame_timing *t)
+static void gl_video_interpolate_frame(struct gl_video *p, struct vo_frame *t,
+                                       int fbo)
 {
     int vp_w = p->dst_rect.x1 - p->dst_rect.x0,
         vp_h = p->dst_rect.y1 - p->dst_rect.y0;
 
+    // Reset the queue completely if this is a still image, to avoid any
+    // interpolation artifacts from surrounding frames when unpausing or
+    // framestepping
+    if (t->still)
+        gl_video_reset_surfaces(p);
+
     // First of all, figure out if we have a frame availble at all, and draw
     // it manually + reset the queue if not
-    if (!p->surfaces[p->surface_now].pts) {
+    if (p->surfaces[p->surface_now].pts == MP_NOPTS_VALUE) {
+        gl_video_upload_image(p, t->current);
         pass_render_frame(p);
         finish_pass_fbo(p, &p->surfaces[p->surface_now].fbotex,
                         vp_w, vp_h, 0, FBOTEX_FUZZY);
-        p->surfaces[p->surface_now].pts = t ? t->pts : 0;
-        p->surfaces[p->surface_now].vpts = p->image.mpi->pts;
+        p->surfaces[p->surface_now].pts = p->image.mpi->pts;
         p->surface_idx = p->surface_now;
+    }
+
+    // Find the right frame for this instant
+    if (t->current&& t->current->pts != MP_NOPTS_VALUE) {
+        int next = fbosurface_wrap(p->surface_now + 1);
+        while (p->surfaces[next].pts != MP_NOPTS_VALUE &&
+               p->surfaces[next].pts > p->surfaces[p->surface_now].pts &&
+               p->surfaces[p->surface_now].pts < t->current->pts)
+        {
+            p->surface_now = next;
+            next = fbosurface_wrap(next + 1);
+        }
     }
 
     // Figure out the queue size. For illustration, a filter radius of 2 would
@@ -2088,6 +2064,7 @@ static void gl_video_interpolate_frame(struct gl_video *p, int fbo,
     reinit_scaler(p, tscale, &p->opts.scaler[3], 1, tscale_sizes);
     bool oversample = strcmp(tscale->conf.kernel.name, "oversample") == 0;
     int size;
+
     if (oversample) {
         size = 2;
     } else {
@@ -2095,25 +2072,39 @@ static void gl_video_interpolate_frame(struct gl_video *p, int fbo,
         size = ceil(tscale->kernel->size);
         assert(size <= TEXUNIT_VIDEO_NUM);
     }
-    int radius = size/2;
 
+    int radius = size/2;
     int surface_now = p->surface_now;
     int surface_nxt = fbosurface_wrap(surface_now + 1);
     int surface_bse = fbosurface_wrap(surface_now - (radius-1));
     int surface_end = fbosurface_wrap(surface_now + radius);
     assert(fbosurface_wrap(surface_bse + size-1) == surface_end);
 
-    // Render a new frame if it came in and there's room in the queue
+    // Render new frames while there's room in the queue. Note that technically,
+    // this should be done before the step where we find the right frame, but
+    // it only barely matters at the very beginning of playback, and this way
+    // makes the code much more linear.
     int surface_dst = fbosurface_wrap(p->surface_idx+1);
-    if (t && surface_dst != surface_bse &&
-             p->surfaces[p->surface_idx].pts < t->pts) {
-        MP_STATS(p, "new-pts");
-        pass_render_frame(p);
-        finish_pass_fbo(p, &p->surfaces[surface_dst].fbotex,
-                        vp_w, vp_h, 0, FBOTEX_FUZZY);
-        p->surfaces[surface_dst].pts = t->pts;
-        p->surfaces[surface_dst].vpts = p->image.mpi->pts;
-        p->surface_idx = surface_dst;
+    for (int i = 0; i < t->num_frames; i++) {
+        // Avoid overwriting data we might still need
+        if (surface_dst == surface_bse - 1)
+            break;
+
+        struct mp_image *f = t->frames[i];
+        if (!mp_image_params_equal(&f->params, &p->real_image_params) ||
+            f->pts == MP_NOPTS_VALUE)
+            continue;
+
+        if (f->pts > p->surfaces[p->surface_idx].pts) {
+            MP_STATS(p, "new-pts");
+            gl_video_upload_image(p, f);
+            pass_render_frame(p);
+            finish_pass_fbo(p, &p->surfaces[surface_dst].fbotex,
+                            vp_w, vp_h, 0, FBOTEX_FUZZY);
+            p->surfaces[surface_dst].pts = f->pts;
+            p->surface_idx = surface_dst;
+            surface_dst = fbosurface_wrap(surface_dst+1);
+        }
     }
 
     // Figure out whether the queue is "valid". A queue is invalid if the
@@ -2124,7 +2115,9 @@ static void gl_video_interpolate_frame(struct gl_video *p, int fbo,
     bool valid = true;
     for (int i = surface_bse, ii; valid && i != surface_end; i = ii) {
         ii = fbosurface_wrap(i+1);
-        if (!p->surfaces[i].pts || !p->surfaces[ii].pts) {
+        if (p->surfaces[i].pts == MP_NOPTS_VALUE ||
+            p->surfaces[ii].pts == MP_NOPTS_VALUE)
+        {
             valid = false;
         } else if (p->surfaces[ii].pts < p->surfaces[i].pts) {
             valid = false;
@@ -2133,36 +2126,42 @@ static void gl_video_interpolate_frame(struct gl_video *p, int fbo,
     }
 
     // Update OSD PTS to synchronize subtitles with the displayed frame
-    if (t) {
-        double vpts_now = p->surfaces[surface_now].vpts,
-               vpts_nxt = p->surfaces[surface_nxt].vpts,
-               vpts_new = p->image.mpi->pts;
-        if (vpts_now != MP_NOPTS_VALUE &&
-            vpts_nxt != MP_NOPTS_VALUE &&
-            vpts_new != MP_NOPTS_VALUE)
-        {
-            // Round to nearest neighbour
-            double vpts_vsync = (t->next_vsync - t->pts)/1e6 + vpts_new;
-            p->osd_pts = fabs(vpts_vsync-vpts_now) < fabs(vpts_vsync-vpts_nxt)
-                             ? vpts_now : vpts_nxt;
-        }
-    }
+    p->osd_pts = p->surfaces[surface_now].pts;
 
     // Finally, draw the right mix of frames to the screen.
-    if (!t || !valid) {
+    if (!valid || t->still) {
         // surface_now is guaranteed to be valid, so we can safely use it.
         pass_load_fbotex(p, &p->surfaces[surface_now].fbotex, 0, vp_w, vp_h);
         GLSL(vec4 color = texture(texture0, texcoord0);)
         p->is_interpolated = false;
     } else {
-        int64_t pts_now = p->surfaces[surface_now].pts,
-                pts_nxt = p->surfaces[surface_nxt].pts;
-        double fscale = pts_nxt - pts_now, mix;
+        double pts_now = p->surfaces[surface_now].pts,
+               pts_nxt = p->surfaces[surface_nxt].pts;
+
+        double mix = (t->vsync_offset / 1e6) / (pts_nxt - pts_now);
+        // The scaler code always wants the fcoord to be between 0 and 1,
+        // so we try to adjust by using the previous set of N frames instead
+        // (which requires some extra checking to make sure it's valid)
+        if (mix < 0.0) {
+            int prev = fbosurface_wrap(surface_bse - 1);
+            if (p->surfaces[prev].pts != MP_NOPTS_VALUE &&
+                p->surfaces[prev].pts < p->surfaces[surface_bse].pts)
+            {
+                mix += 1.0;
+                surface_bse = prev;
+            } else {
+                mix = 0.0; // at least don't blow up, this should only
+                           // ever happen at the start of playback
+            }
+        }
+
+        // Blend the frames together
         if (oversample) {
-            double vsync_interval = t->next_vsync - t->prev_vsync,
+            double vsync_dist = (t->next_vsync - t->prev_vsync)/1e6
+                                / (pts_nxt - pts_now),
                    threshold = tscale->conf.kernel.params[0];
             threshold = isnan(threshold) ? 0.0 : threshold;
-            mix = (pts_nxt - t->next_vsync) / vsync_interval;
+            mix = (1 - mix) / vsync_dist;
             mix = mix <= 0 + threshold ? 0 : mix;
             mix = mix >= 1 - threshold ? 1 : mix;
             mix = 1 - mix;
@@ -2171,32 +2170,24 @@ static void gl_video_interpolate_frame(struct gl_video *p, int fbo,
                                   texture(texture1, texcoord1),
                                   inter_coeff);)
         } else {
-            mix = (t->next_vsync - pts_now) / fscale;
             gl_sc_uniform_f(p->sc, "fcoord", mix);
             pass_sample_separated_gen(p, tscale, 0, 0);
         }
+
+        // Load all the required frames
         for (int i = 0; i < size; i++) {
             pass_load_fbotex(p, &p->surfaces[fbosurface_wrap(surface_bse+i)].fbotex,
                              i, vp_w, vp_h);
         }
+
         MP_STATS(p, "frame-mix");
-        MP_DBG(p, "inter frame ppts: %lld, pts: %lld, vsync: %lld, mix: %f\n",
-               (long long)pts_now, (long long)pts_nxt,
-               (long long)t->next_vsync, mix);
+        MP_DBG(p, "inter frame pts: %lld, vsync: %lld, mix: %f\n",
+               (long long)t->pts, (long long)t->next_vsync, mix);
         p->is_interpolated = true;
     }
     pass_draw_to_screen(p, fbo);
 
-    // Dequeue frames if necessary
-    if (t) {
-        int64_t vsync_interval = t->next_vsync - t->prev_vsync;
-        int64_t vsync_guess = t->next_vsync + vsync_interval;
-        if (p->surfaces[surface_nxt].pts > p->surfaces[p->surface_now].pts &&
-            p->surfaces[surface_nxt].pts < vsync_guess)
-        {
-            p->surface_now = surface_nxt;
-        }
-    }
+    p->frames_drawn += 1;
 }
 
 void gl_video_render_osd(struct gl_video *p, const struct mp_osd_res *res, void(*cb)(void*,struct sub_bitmaps*), void *ctx)
@@ -2206,14 +2197,16 @@ void gl_video_render_osd(struct gl_video *p, const struct mp_osd_res *res, void(
 }
 
 // (fbo==0 makes BindFramebuffer select the screen backbuffer)
-void gl_video_render_frame(struct gl_video *p, int fbo, struct frame_timing *t)
+void gl_video_render_frame(struct gl_video *p, struct vo_frame *frame, int fbo)
 {
     GL *gl = p->gl;
     struct video_image *vimg = &p->image;
 
     gl->BindFramebuffer(GL_FRAMEBUFFER, fbo);
 
-    if (!vimg->mpi || p->dst_rect.x0 > 0 || p->dst_rect.y0 > 0 ||
+    bool has_frame = frame->current || vimg->mpi;
+
+    if (!has_frame || p->dst_rect.x0 > 0 || p->dst_rect.y0 > 0 ||
         p->dst_rect.x1 < p->vp_w || p->dst_rect.y1 < abs(p->vp_h))
     {
         struct m_color c = p->opts.background;
@@ -2221,21 +2214,22 @@ void gl_video_render_frame(struct gl_video *p, int fbo, struct frame_timing *t)
         gl->Clear(GL_COLOR_BUFFER_BIT);
     }
 
-    if (vimg->mpi) {
-        gl_video_upload_image(p);
-
+    if (has_frame) {
         gl_sc_set_vao(p->sc, &p->vao);
 
-        if (p->opts.interpolation) {
-            gl_video_interpolate_frame(p, fbo, t);
+        if (p->opts.interpolation && (p->frames_drawn || !frame->still)) {
+            gl_video_interpolate_frame(p, frame, fbo);
         } else {
             // Skip interpolation if there's nothing to be done
+            if (!frame->redraw || !vimg->mpi)
+                gl_video_upload_image(p, frame->current);
             pass_render_frame(p);
             pass_draw_to_screen(p, fbo);
         }
-
-        debug_check_gl(p, "after video rendering");
     }
+
+    debug_check_gl(p, "after video rendering");
+
 /*
     gl->BindFramebuffer(GL_FRAMEBUFFER, fbo);
 
@@ -2245,6 +2239,7 @@ void gl_video_render_frame(struct gl_video *p, int fbo, struct frame_timing *t)
         debug_check_gl(p, "after OSD rendering");
     }
 */
+
     gl->UseProgram(0);
     gl->BindFramebuffer(GL_FRAMEBUFFER, 0);
 
@@ -2266,7 +2261,22 @@ void gl_video_resize(struct gl_video *p, int vp_w, int vp_h,
     gl_video_reset_surfaces(p);
 }
 
-static bool get_image(struct gl_video *p, struct mp_image *mpi)
+static bool unmap_image(struct gl_video *p, struct mp_image *mpi)
+{
+    GL *gl = p->gl;
+    bool ok = true;
+    struct video_image *vimg = &p->image;
+    for (int n = 0; n < p->plane_count; n++) {
+        struct texplane *plane = &vimg->planes[n];
+        gl->BindBuffer(GL_PIXEL_UNPACK_BUFFER, plane->gl_buffer);
+        ok = gl->UnmapBuffer(GL_PIXEL_UNPACK_BUFFER) && ok;
+        mpi->planes[n] = NULL; // PBO offset 0
+    }
+    gl->BindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+    return ok;
+}
+
+static bool map_image(struct gl_video *p, struct mp_image *mpi)
 {
     GL *gl = p->gl;
 
@@ -2275,85 +2285,74 @@ static bool get_image(struct gl_video *p, struct mp_image *mpi)
 
     struct video_image *vimg = &p->image;
 
-    // See comments in init_video() about odd video sizes.
-    // The normal upload path does this too, but less explicit.
-    mp_image_set_size(mpi, vimg->planes[0].w, vimg->planes[0].h);
-
     for (int n = 0; n < p->plane_count; n++) {
         struct texplane *plane = &vimg->planes[n];
         mpi->stride[n] = mp_image_plane_w(mpi, n) * p->image_desc.bytes[n];
-        int needed_size = mp_image_plane_h(mpi, n) * mpi->stride[n];
-        if (!plane->gl_buffer)
+        if (!plane->gl_buffer) {
             gl->GenBuffers(1, &plane->gl_buffer);
-        gl->BindBuffer(GL_PIXEL_UNPACK_BUFFER, plane->gl_buffer);
-        if (needed_size > plane->buffer_size) {
-            plane->buffer_size = needed_size;
-            gl->BufferData(GL_PIXEL_UNPACK_BUFFER, plane->buffer_size,
+            gl->BindBuffer(GL_PIXEL_UNPACK_BUFFER, plane->gl_buffer);
+            size_t buffer_size = mp_image_plane_h(mpi, n) * mpi->stride[n];
+            gl->BufferData(GL_PIXEL_UNPACK_BUFFER, buffer_size,
                            NULL, GL_DYNAMIC_DRAW);
         }
-        if (!plane->buffer_ptr)
-            plane->buffer_ptr = gl->MapBuffer(GL_PIXEL_UNPACK_BUFFER,
-                                              GL_WRITE_ONLY);
-        mpi->planes[n] = plane->buffer_ptr;
+        gl->BindBuffer(GL_PIXEL_UNPACK_BUFFER, plane->gl_buffer);
+        mpi->planes[n] = gl->MapBuffer(GL_PIXEL_UNPACK_BUFFER, GL_WRITE_ONLY);
         gl->BindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+        if (!mpi->planes[n]) {
+            unmap_image(p, mpi);
+            return false;
+        }
     }
+    memset(mpi->bufs, 0, sizeof(mpi->bufs));
     return true;
 }
 
-void gl_video_set_image(struct gl_video *p, struct mp_image *mpi)
-{
-    assert(mpi);
-
-    struct video_image *vimg = &p->image;
-    talloc_free(vimg->mpi);
-    vimg->mpi = mpi;
-    vimg->needs_upload = true;
-
-    p->osd_pts = mpi->pts;
-}
-
-static void gl_video_upload_image(struct gl_video *p)
+static void gl_video_upload_image(struct gl_video *p, struct mp_image *mpi)
 {
     GL *gl = p->gl;
-
     struct video_image *vimg = &p->image;
-    struct mp_image *mpi = vimg->mpi;
 
-    if (p->hwdec_active || !mpi || !vimg->needs_upload)
-        return;
+    mpi = mp_image_new_ref(mpi);
+    if (!mpi)
+        abort();
 
-    vimg->needs_upload = false;
+    talloc_free(vimg->mpi);
+    vimg->mpi = mpi;
+    p->osd_pts = mpi->pts;
     p->frames_uploaded++;
+
+    if (p->hwdec_active) {
+        GLuint imgtex[4] = {0};
+        bool ok = p->hwdec->driver->map_image(p->hwdec, vimg->mpi, imgtex) >= 0;
+        for (int n = 0; n < p->plane_count; n++)
+            vimg->planes[n].gl_texture = ok ? imgtex[n] : -1;
+        return;
+    }
 
     assert(mpi->num_planes == p->plane_count);
 
-    mp_image_t mpi2 = *mpi;
-    bool pbo = false;
-    if (!vimg->planes[0].buffer_ptr && get_image(p, &mpi2)) {
-        for (int n = 0; n < p->plane_count; n++) {
-            int line_bytes = mp_image_plane_w(mpi, n) * p->image_desc.bytes[n];
-            int plane_h = mp_image_plane_h(mpi, n);
-            memcpy_pic(mpi2.planes[n], mpi->planes[n], line_bytes, plane_h,
-                       mpi2.stride[n], mpi->stride[n]);
+    mp_image_t pbo_mpi = *mpi;
+    bool pbo = map_image(p, &pbo_mpi);
+    if (pbo) {
+        mp_image_copy(&pbo_mpi, mpi);
+        if (unmap_image(p, &pbo_mpi)) {
+            mpi = &pbo_mpi;
+        } else {
+            MP_FATAL(p, "Video PBO upload failed. Disabling PBOs.\n");
+            pbo = false;
+            p->opts.pbo = 0;
         }
-        pbo = true;
     }
-    vimg->image_flipped = mpi2.stride[0] < 0;
+
+    vimg->image_flipped = mpi->stride[0] < 0;
     for (int n = 0; n < p->plane_count; n++) {
         struct texplane *plane = &vimg->planes[n];
-        void *plane_ptr = mpi2.planes[n];
-        if (pbo) {
+        if (pbo)
             gl->BindBuffer(GL_PIXEL_UNPACK_BUFFER, plane->gl_buffer);
-            if (!gl->UnmapBuffer(GL_PIXEL_UNPACK_BUFFER))
-                MP_FATAL(p, "Video PBO upload failed. "
-                         "Remove the 'pbo' suboption.\n");
-            plane->buffer_ptr = NULL;
-            plane_ptr = NULL; // PBO offset 0
-        }
         gl->ActiveTexture(GL_TEXTURE0 + n);
         gl->BindTexture(p->gl_target, plane->gl_texture);
         glUploadTex(gl, p->gl_target, plane->gl_format, plane->gl_type,
-                    plane_ptr, mpi2.stride[n], 0, 0, plane->w, plane->h, 0);
+                    mpi->planes[n], mpi->stride[n], 0, 0, plane->w, plane->h, 0);
     }
     gl->ActiveTexture(GL_TEXTURE0);
     if (pbo)
@@ -2400,14 +2399,14 @@ static void check_gl_features(struct gl_video *p)
         if (kernel) {
             char *reason = NULL;
             if (!test_fbo(p, &have_fbo))
-                reason = "scaler (FBOs missing)";
+                reason = "(FBOs missing)";
             if (!have_float_tex)
-                reason = "scaler (float tex. missing)";
+                reason = "(float tex. missing)";
             if (!have_1d_tex && kernel->polar)
-                reason = "scaler (1D tex. missing)";
+                reason = "(1D tex. missing)";
             if (reason) {
                 p->opts.scaler[n].kernel.name = "bilinear";
-                MP_WARN(p, "Disabling %s.\n", reason);
+                MP_WARN(p, "Disabling scaler #%d %s.\n", n, reason);
             }
         }
     }
@@ -2786,8 +2785,7 @@ static char **dup_str_array(void *parent, char **src)
 
 // Set the options, and possibly update the filter chain too.
 // Note: assumes all options are valid and verified by the option parser.
-void gl_video_set_options(struct gl_video *p, struct gl_video_opts *opts,
-                          int *queue_size)
+void gl_video_set_options(struct gl_video *p, struct gl_video_opts *opts)
 {
     talloc_free(p->opts.source_shader);
     talloc_free(p->opts.scale_shader);
@@ -2801,20 +2799,6 @@ void gl_video_set_options(struct gl_video *p, struct gl_video_opts *opts,
             (char *)handle_scaler_opt(p->opts.scaler[n].kernel.name, n==3);
     }
 
-    // Figure out an adequate size for the interpolation queue. The larger
-    // the radius, the earlier we need to queue frames. This rough heuristic
-    // seems to work for now, but ideally we want to rework the pause/unpause
-    // logic to make larger queue sizes the default.
-    if (queue_size && p->opts.interpolation) {
-        const struct filter_kernel *kernel =
-            mp_find_filter_kernel(p->opts.scaler[3].kernel.name);
-        if (kernel) {
-            double radius = kernel->f.radius;
-            radius = radius > 0 ? radius : p->opts.scaler[3].radius;
-           *queue_size = 50e3 * ceil(radius);
-        }
-    }
-
     p->opts.source_shader = talloc_strdup(p, p->opts.source_shader);
     p->opts.scale_shader = talloc_strdup(p, p->opts.scale_shader);
     p->opts.pre_shaders = dup_str_array(p, p->opts.pre_shaders);
@@ -2822,6 +2806,28 @@ void gl_video_set_options(struct gl_video *p, struct gl_video_opts *opts,
 
     check_gl_features(p);
     uninit_rendering(p);
+}
+
+void gl_video_configure_queue(struct gl_video *p, struct vo *vo)
+{
+    int queue_size = 1;
+
+    // Figure out an adequate size for the interpolation queue. The larger
+    // the radius, the earlier we need to queue frames.
+    if (p->opts.interpolation) {
+        const struct filter_kernel *kernel =
+            mp_find_filter_kernel(p->opts.scaler[3].kernel.name);
+        if (kernel) {
+            double radius = kernel->f.radius;
+            radius = radius > 0 ? radius : p->opts.scaler[3].radius;
+            queue_size += 1 + ceil(radius);
+        } else {
+            // Oversample case
+            queue_size += 2;
+        }
+    }
+
+    vo_set_queue_params(vo, 0, p->opts.interpolation, queue_size);
 }
 
 struct mp_csp_equalizer *gl_video_eq_ptr(struct gl_video *p)
